@@ -180,3 +180,7 @@ rf-detr*
 output/*
 
 train_test.py
+
+# Ddatasets
+imagenet*/
+coco*/

@@ -13,4 +13,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 # ------------------------------------------------------------------------
 
-from .lwdetr import build_model, build_criterion_and_postprocessors, PostProcess
+from .lwdetr import (
+	build_model,
+	build_criterion_and_postprocessors,
+	PostProcess,
+	build_classification_model,
+	build_classification_criterion,
+)

@@ -295,7 +295,8 @@ class SetCriterion(nn.Module):
                 use_varifocal_loss=False,
                 use_position_supervised_loss=False,
                 ia_bce_loss=False,
-                mask_point_sample_ratio: int = 16,):
+                mask_point_sample_ratio: int = 16,
+                multi_label: bool = False,):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -317,6 +318,7 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.multi_label = multi_label
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -324,6 +326,32 @@ class SetCriterion(nn.Module):
         """
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
+
+        if self.multi_label:
+            idx = self._get_src_permutation_idx(indices)
+            target_classes = torch.zeros_like(src_logits)
+            if len(indices) > 0:
+                target_multi = []
+                for t, (_, J) in zip(targets, indices):
+                    if 'multi_labels' in t:
+                        target_multi.append(t['multi_labels'][J].float())
+                    else:
+                        target_multi.append(F.one_hot(t['labels'][J], num_classes=self.num_classes).float())
+                target_multi = torch.cat(target_multi, dim=0)
+                target_classes[idx] = target_multi
+            loss_ce = F.binary_cross_entropy_with_logits(src_logits, target_classes, reduction='none')
+            loss_ce = loss_ce.sum() / num_boxes
+            losses = {'loss_ce': loss_ce}
+            if log:
+                if len(indices) == 0:
+                    losses['class_error'] = torch.zeros(1, device=src_logits.device)
+                else:
+                    with torch.no_grad():
+                        pred = (src_logits[idx].sigmoid() > 0.5).float()
+                        target_for_log = target_classes[idx]
+                        correct = (pred == target_for_log).float().mean() if target_for_log.numel() > 0 else torch.tensor(1.0, device=src_logits.device)
+                        losses['class_error'] = (1 - correct) * 100
+            return losses
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
@@ -419,8 +447,11 @@ class SetCriterion(nn.Module):
         pred_logits = outputs['pred_logits']
         device = pred_logits.device
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
-        # Count the number of predictions that are NOT "no-object" (which is the last class)
-        card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
+        if self.multi_label:
+            card_pred = (pred_logits.sigmoid().amax(-1) > 0.5).sum(1)
+        else:
+            # Count the number of predictions that are NOT "no-object" (which is the last class)
+            card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {'cardinality_error': card_err}
         return losses
@@ -767,6 +798,85 @@ class MLP(nn.Module):
         return x
 
 
+class MultiLabelClassifier(nn.Module):
+    """Multi-label image classifier reusing RF-DETR backbone + transformer.
+
+    Uses decoder outputs pooled across queries to predict image-level logits.
+    """
+    def __init__(self,
+                 backbone,
+                 transformer,
+                 num_classes,
+                 num_queries,
+                 group_detr=1,
+                 two_stage=False,
+                 lite_refpoint_refine=False,
+                 bbox_reparam=False):
+        super().__init__()
+        self.num_queries = num_queries
+        self.transformer = transformer
+        hidden_dim = transformer.d_model
+        self.class_embed = nn.Linear(hidden_dim, num_classes)
+
+        query_dim = 4
+        self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
+        self.query_feat = nn.Embedding(num_queries * group_detr, hidden_dim)
+        nn.init.constant_(self.refpoint_embed.weight.data, 0)
+
+        self.backbone = backbone
+        self.group_detr = group_detr
+        self.two_stage = two_stage
+        self.lite_refpoint_refine = lite_refpoint_refine
+        self.bbox_reparam = bbox_reparam
+
+    def forward(self, samples: NestedTensor):
+        if isinstance(samples, (list, torch.Tensor)):
+            samples = nested_tensor_from_tensor_list(samples)
+
+        features, poss = self.backbone(samples)
+
+        srcs = []
+        masks = []
+        for feat in features:
+            src, mask = feat.decompose()
+            srcs.append(src)
+            masks.append(mask)
+
+        refpoint_embed_weight = self.refpoint_embed.weight[:self.num_queries]
+        query_feat_weight = self.query_feat.weight[:self.num_queries]
+
+        hs, _, hs_enc, _ = self.transformer(
+            srcs, masks, poss, refpoint_embed_weight, query_feat_weight)
+
+        if hs is not None:
+            pooled = hs[-1].mean(1)  # [B, hidden]
+        else:
+            # encoder only path
+            pooled = hs_enc.mean(1)
+
+        logits = self.class_embed(pooled)
+        return {"logits": logits}
+
+    def reinitialize_classification_head(self, num_classes: int):
+        hidden_dim = self.class_embed.in_features
+        device = self.class_embed.weight.device
+        self.class_embed = nn.Linear(hidden_dim, num_classes).to(device)
+
+
+class ClassificationCriterion(nn.Module):
+    """BCE-with-logits loss for multi-label classification."""
+
+    def __init__(self, pos_weight=None):
+        super().__init__()
+        self.register_buffer("pos_weight", pos_weight if pos_weight is not None else None)
+
+    def forward(self, outputs, targets):
+        logits = outputs["logits"]
+        labels = torch.stack([t["labels_multi"] for t in targets], dim=0).to(logits.dtype)
+        loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=self.pos_weight)
+        return {"loss_ce": loss}
+
+
 def build_model(args):
     # the `num_classes` naming here is somewhat misleading.
     # it indeed corresponds to `max_obj_id + 1`, where max_obj_id
@@ -776,7 +886,7 @@ def build_model(args):
     # you should pass `num_classes` to be 2 (max_obj_id + 1).
     # For more details on this, check the following discussion
     # https://github.com/facebookresearch/detr/issues/108#issuecomment-650269223
-    num_classes = args.num_classes + 1
+    num_classes = args.num_classes if getattr(args, 'multi_label', False) else args.num_classes + 1
     device = torch.device(args.device)
 
 
@@ -828,9 +938,63 @@ def build_model(args):
     )
     return model
 
+
+def build_classification_model(args):
+    """Build multi-label image classification model using RF-DETR backbone/transformer."""
+    device = torch.device(args.device)
+
+    backbone = build_backbone(
+        encoder=args.encoder,
+        vit_encoder_num_layers=args.vit_encoder_num_layers,
+        pretrained_encoder=args.pretrained_encoder,
+        window_block_indexes=args.window_block_indexes,
+        drop_path=args.drop_path,
+        out_channels=args.hidden_dim,
+        out_feature_indexes=args.out_feature_indexes,
+        projector_scale=args.projector_scale,
+        use_cls_token=args.use_cls_token,
+        hidden_dim=args.hidden_dim,
+        position_embedding=args.position_embedding,
+        freeze_encoder=args.freeze_encoder,
+        layer_norm=args.layer_norm,
+        target_shape=(args.resolution, args.resolution),
+        rms_norm=args.rms_norm,
+        backbone_lora=args.backbone_lora,
+        force_no_pretrain=args.force_no_pretrain,
+        gradient_checkpointing=args.gradient_checkpointing,
+        load_dinov2_weights=args.pretrain_weights is None,
+        patch_size=args.patch_size,
+        num_windows=args.num_windows,
+        positional_encoding_size=args.positional_encoding_size,
+    )
+
+    args.num_feature_levels = len(args.projector_scale)
+    transformer = build_transformer(args)
+
+    model = MultiLabelClassifier(
+        backbone=backbone,
+        transformer=transformer,
+        num_classes=args.num_classes,
+        num_queries=args.num_queries,
+        group_detr=args.group_detr,
+        two_stage=args.two_stage,
+        lite_refpoint_refine=args.lite_refpoint_refine,
+        bbox_reparam=args.bbox_reparam,
+    )
+
+    return model.to(device)
+
+
+def build_classification_criterion(args):
+    pos_weight = None
+    if hasattr(args, "pos_weight") and args.pos_weight is not None:
+        pos_weight = torch.tensor(args.pos_weight, device=args.device, dtype=torch.float32)
+    return ClassificationCriterion(pos_weight=pos_weight)
+
 def build_criterion_and_postprocessors(args):
     device = torch.device(args.device)
     matcher = build_matcher(args)
+    num_classes_for_loss = args.num_classes if getattr(args, 'multi_label', False) else args.num_classes + 1
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
     if args.segmentation_head:
@@ -854,20 +1018,22 @@ def build_criterion_and_postprocessors(args):
     except:
         sum_group_losses = False
     if args.segmentation_head:
-        criterion = SetCriterion(args.num_classes + 1, matcher=matcher, weight_dict=weight_dict,
+        criterion = SetCriterion(num_classes_for_loss, matcher=matcher, weight_dict=weight_dict,
                                 focal_alpha=args.focal_alpha, losses=losses,
                                 group_detr=args.group_detr, sum_group_losses=sum_group_losses,
                                 use_varifocal_loss = args.use_varifocal_loss,
                                 use_position_supervised_loss=args.use_position_supervised_loss,
                                 ia_bce_loss=args.ia_bce_loss,
+                                multi_label=getattr(args, 'multi_label', False),
                                 mask_point_sample_ratio=args.mask_point_sample_ratio)
     else:
-        criterion = SetCriterion(args.num_classes + 1, matcher=matcher, weight_dict=weight_dict,
+        criterion = SetCriterion(num_classes_for_loss, matcher=matcher, weight_dict=weight_dict,
                                 focal_alpha=args.focal_alpha, losses=losses,
                                 group_detr=args.group_detr, sum_group_losses=sum_group_losses,
                                 use_varifocal_loss = args.use_varifocal_loss,
                                 use_position_supervised_loss=args.use_position_supervised_loss,
-                                ia_bce_loss=args.ia_bce_loss)
+                                ia_bce_loss=args.ia_bce_loss,
+                                multi_label=getattr(args, 'multi_label', False))
     criterion.to(device)
     postprocess = PostProcess(num_select=args.num_select)
 

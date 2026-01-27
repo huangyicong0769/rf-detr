@@ -11,6 +11,7 @@ import torch
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 class ModelConfig(BaseModel):
+    task: Literal["detection", "classification"] = "detection"
     encoder: Literal["dinov2_windowed_small", "dinov2_windowed_base"]
     out_feature_indexes: List[int]
     dec_layers: int
@@ -37,6 +38,7 @@ class ModelConfig(BaseModel):
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
+    multi_label: bool = False
 
 
 class RFDETRBaseConfig(ModelConfig):
@@ -120,7 +122,42 @@ class RFDETRSegPreviewConfig(RFDETRBaseConfig):
     pretrain_weights: Optional[str] = "rf-detr-seg-preview.pt"
     num_classes: int = 90
 
+
+# Classification model configs by size
+class RFDETRClassificationBaseConfig(RFDETRBaseConfig):
+    task: Literal["classification"] = "classification"
+    multi_label: bool = True
+    pretrain_weights: Optional[str] = None
+    two_stage: bool = False
+    lite_refpoint_refine: bool = False
+    group_detr: int = 1
+
+
+class RFDETRClassificationLargeConfig(RFDETRClassificationBaseConfig, RFDETRLargeConfig):
+    task: Literal["classification"] = "classification"
+    multi_label: bool = True
+    pretrain_weights: Optional[str] = None
+
+
+class RFDETRClassificationNanoConfig(RFDETRClassificationBaseConfig, RFDETRNanoConfig):
+    task: Literal["classification"] = "classification"
+    multi_label: bool = True
+    pretrain_weights: Optional[str] = None
+
+
+class RFDETRClassificationSmallConfig(RFDETRClassificationBaseConfig, RFDETRSmallConfig):
+    task: Literal["classification"] = "classification"
+    multi_label: bool = True
+    pretrain_weights: Optional[str] = None
+
+
+class RFDETRClassificationMediumConfig(RFDETRClassificationBaseConfig, RFDETRMediumConfig):
+    task: Literal["classification"] = "classification"
+    multi_label: bool = True
+    pretrain_weights: Optional[str] = None
+
 class TrainConfig(BaseModel):
+    task: Literal["detection", "classification"] = "detection"
     lr: float = 1e-4
     lr_encoder: float = 1.5e-4
     batch_size: int = 4
@@ -159,6 +196,8 @@ class TrainConfig(BaseModel):
     class_names: List[str] = None
     run_test: bool = True
     segmentation_head: bool = False
+    multi_label: bool = False
+    use_test_split: bool = False
 
 
 class SegmentationTrainConfig(TrainConfig):
@@ -167,3 +206,18 @@ class SegmentationTrainConfig(TrainConfig):
     mask_dice_loss_coef: float = 5.0
     cls_loss_coef: float = 5.0
     segmentation_head: bool = True
+
+
+class RFDETRClassificationConfig(RFDETRBaseConfig):
+    task: Literal["classification"] = "classification"
+    multi_label: bool = True
+
+
+class ClassificationTrainConfig(TrainConfig):
+    task: Literal["classification"] = "classification"
+    dataset_file: Literal["coco"] = "coco"
+    multi_label: bool = True
+    use_test_split: bool = False
+    group_detr: int = 1
+    coco_path: Optional[str] = None
+    dataset_dir: Optional[str] = None

@@ -64,11 +64,12 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 class CocoDetection(torchvision.datasets.CocoDetection):
-    def __init__(self, img_folder, ann_file, transforms, include_masks=False):
+    def __init__(self, img_folder, ann_file, transforms, include_masks=False, num_classes=None, multi_label=False):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.include_masks = include_masks
-        self.prepare = ConvertCoco(include_masks=include_masks)
+        self.multi_label = multi_label
+        self.prepare = ConvertCoco(include_masks=include_masks, num_classes=num_classes, multi_label=multi_label)
 
     def __getitem__(self, idx):
         img, target = super(CocoDetection, self).__getitem__(idx)
@@ -80,10 +81,31 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         return img, target
 
 
+class CocoClassification(CocoDetection):
+    """Image-level multi-label classification using COCO annotations.
+
+    Builds a multi-hot vector over categories present in the image.
+    """
+    def __init__(self, img_folder, ann_file, transforms, num_classes):
+        super().__init__(img_folder, ann_file, transforms=transforms, include_masks=False, num_classes=num_classes, multi_label=True)
+        self.num_classes = num_classes
+
+    def __getitem__(self, idx):
+        img, target = super().__getitem__(idx)
+        labels = target.get("labels", torch.zeros((0,), dtype=torch.int64))
+        multi = torch.zeros(self.num_classes, dtype=torch.float32)
+        if labels.numel() > 0:
+            multi.scatter_(0, labels.clamp(min=0, max=self.num_classes - 1), 1.0)
+        target = {'labels_multi': multi, 'image_id': target['image_id'], 'orig_size': target['orig_size'], 'size': target['size']}
+        return img, target
+
+
 class ConvertCoco(object):
 
-    def __init__(self, include_masks=False):
+    def __init__(self, include_masks=False, num_classes=None, multi_label=False):
         self.include_masks = include_masks
+        self.num_classes = num_classes
+        self.multi_label = multi_label
 
     def __call__(self, image, target):
         w, h = image.size
@@ -102,8 +124,8 @@ class ConvertCoco(object):
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        classes = [obj["category_id"] for obj in anno]
-        classes = torch.tensor(classes, dtype=torch.int64)
+        classes_raw = [obj.get("category_id", obj.get("category_ids", [])) for obj in anno]
+        classes = torch.tensor([c[0] if isinstance(c, (list, tuple)) and len(c) > 0 else c for c in classes_raw], dtype=torch.int64)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
@@ -112,6 +134,25 @@ class ConvertCoco(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = classes
+
+        if self.multi_label:
+            if self.num_classes is None:
+                raise ValueError("num_classes must be provided when multi_label is enabled")
+            if len(classes_raw) == 0:
+                target["multi_labels"] = torch.zeros((0, self.num_classes), dtype=torch.float32)
+            else:
+                multi_labels = torch.zeros((len(classes_raw), self.num_classes), dtype=torch.float32)
+                for idx, cls_val in enumerate(classes_raw):
+                    if isinstance(cls_val, (list, tuple)):
+                        for cid in cls_val:
+                            if 0 <= cid < self.num_classes:
+                                multi_labels[idx, cid] = 1.0
+                    else:
+                        cid = int(cls_val)
+                        if 0 <= cid < self.num_classes:
+                            multi_labels[idx, cid] = 1.0
+                multi_labels = multi_labels[keep]
+                target["multi_labels"] = multi_labels
         target["image_id"] = image_id
 
         # for conversion to coco api
@@ -265,7 +306,7 @@ def build(image_set, args, resolution):
             skip_random_resize=not args.do_random_resize_via_padding,
             patch_size=args.patch_size,
             num_windows=args.num_windows
-        ))
+        ), include_masks=False, num_classes=args.num_classes, multi_label=getattr(args, 'multi_label', False))
     else:
         dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(
             image_set,
@@ -275,7 +316,61 @@ def build(image_set, args, resolution):
             skip_random_resize=not args.do_random_resize_via_padding,
             patch_size=args.patch_size,
             num_windows=args.num_windows
-        ))
+        ), include_masks=False, num_classes=args.num_classes, multi_label=getattr(args, 'multi_label', False))
+    return dataset
+
+
+def build_coco_classification(image_set, args, resolution):
+    """Build COCO multi-label classification dataset.
+
+    Uses the same transforms as detection; aggregates labels per image into a multi-hot vector.
+    """
+    root = Path(args.coco_path)
+    assert root.exists(), f'provided COCO path {root} does not exist'
+    mode = 'instances'
+    PATHS = {
+        "train": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
+        "val": (root /  "val2017", root / "annotations" / f'{mode}_val2017.json'),
+        "test": (root / "test2017", root / "annotations" / f'image_info_test-dev2017.json'),
+    }
+
+    img_folder, ann_file = PATHS[image_set.split("_")[0]]
+
+    try:
+        square_resize_div_64 = args.square_resize_div_64
+    except:
+        square_resize_div_64 = False
+
+    if square_resize_div_64:
+        dataset = CocoClassification(
+            img_folder,
+            ann_file,
+            transforms=make_coco_transforms_square_div_64(
+                image_set,
+                resolution,
+                multi_scale=args.multi_scale,
+                expanded_scales=args.expanded_scales,
+                skip_random_resize=not args.do_random_resize_via_padding,
+                patch_size=args.patch_size,
+                num_windows=args.num_windows
+            ),
+            num_classes=args.num_classes,
+        )
+    else:
+        dataset = CocoClassification(
+            img_folder,
+            ann_file,
+            transforms=make_coco_transforms(
+                image_set,
+                resolution,
+                multi_scale=args.multi_scale,
+                expanded_scales=args.expanded_scales,
+                skip_random_resize=not args.do_random_resize_via_padding,
+                patch_size=args.patch_size,
+                num_windows=args.num_windows
+            ),
+            num_classes=args.num_classes,
+        )
     return dataset
 
 def build_roboflow(image_set, args, resolution):
@@ -315,7 +410,7 @@ def build_roboflow(image_set, args, resolution):
             skip_random_resize=not args.do_random_resize_via_padding,
             patch_size=args.patch_size,
             num_windows=args.num_windows
-        ), include_masks=include_masks)
+        ), include_masks=include_masks, num_classes=args.num_classes, multi_label=getattr(args, 'multi_label', False))
     else:
         dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(
             image_set,
@@ -325,5 +420,5 @@ def build_roboflow(image_set, args, resolution):
             skip_random_resize=not args.do_random_resize_via_padding,
             patch_size=args.patch_size,
             num_windows=args.num_windows
-        ), include_masks=include_masks)
+        ), include_masks=include_masks, num_classes=args.num_classes, multi_label=getattr(args, 'multi_label', False))
     return dataset

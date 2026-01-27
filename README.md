@@ -14,6 +14,8 @@
 
 RF-DETR is a real-time, transformer-based object detection and instance segmentation model architecture developed by Roboflow and released under the Apache 2.0 license.
 
+> Note: This repository is maintained for experimental/learning purposes and is **not** an official Roboflow release. For the canonical project and latest official assets, see https://github.com/roboflow/rf-detr.
+
 RF-DETR is the first real-time model to exceed 60 AP on the [Microsoft COCO object detection benchmark](https://cocodataset.org/#home) alongside competitive performance at base sizes. It also achieves state-of-the-art performance on [RF100-VL](https://github.com/roboflow/rf100-vl), an object detection benchmark that measures model domain adaptability to real world problems. RF-DETR is fastest and most accurate for its size when compared current real-time objection models.
 
 On image segmentation, RF-DETR Seg (Preview) is 3x faster and more accurate than the largest YOLO when evaluated on the Microsoft COCO Segmentation benchmark, defining a new real-time state-of-the-art for the industry-standard benchmark in segmentation model evaluation.
@@ -175,6 +177,70 @@ sv.plot_image(annotated_image)
 You can fine-tune an RF-DETR Nano, Small, Medium, and Base model with a custom dataset using the `rfdetr` Python package.
 
 [Learn how to train an RF-DETR model.](https://rfdetr.roboflow.com/learn/train/)
+
+### Image Classification
+
+> Note: Classification support here is an experimental, non-official adaptation of RF-DETR. For the official project, see https://github.com/roboflow/rf-detr.
+
+RF-DETR ships with a multi-label image classification head built on the same encoder-decoder backbone. The training loop reuses the detection utilities (EMA, TensorBoard/W&B logging, early stopping) while swapping in a BCE-with-logits loss for multi-label outputs.
+
+**Data format**
+- Expects COCO-style annotations with one box covering the full image. For COCO, point `--coco_path` to the dataset root. For custom ImageNet-style folders, convert to COCO classification via `scripts/convert_imagenet_to_coco.py`:
+
+```bash
+python scripts/convert_imagenet_to_coco.py \
+  imagenet_data/tiny-imagenet-200 \
+  coco_clf_out \
+  --wnids imagenet_data/tiny-imagenet-200/wnids.txt \
+  --words imagenet_data/tiny-imagenet-200/words.txt \
+  --splits train val --flatten --progress
+```
+
+The command writes `annotations/instances_[train|val]2017.json` plus `train2017/` and `val2017/` image folders that the trainer reads directly.
+
+**Quick start (Python API)**
+
+```python
+from rfdetr import RFDETRClassificationNano
+
+model = RFDETRClassificationNano(patch_size=14, resolution=112)
+model.train(
+    dataset_file="coco",
+    coco_path="coco_clf_out",
+    dataset_dir="coco_clf_out",
+    output_dir="output/cls-tiny",
+    num_classes=200,
+    epochs=1,
+    batch_size=64,
+    grad_accum_steps=2,
+    use_test_split=False,
+    num_workers=8,
+    two_stage=False,
+    lite_refpoint_refine=False,
+    freeze_encoder=True,
+    pretrain_weights=None,
+    force_no_pretrain=False,
+)
+```
+
+**Quick start (CLI)**
+
+```bash
+python -m rfdetr.main --task classification \
+  --dataset_file coco --coco_path coco_clf_out --dataset_dir coco_clf_out \
+  --output_dir output/cls-run --num_classes 200 --epochs 1 --batch_size 64 \
+  --grad_accum_steps 2 --multi_label --freeze_encoder --two_stage False \
+  --lite_refpoint_refine False --use_test_split False
+```
+
+During training, checkpoints are written to `output/cls-run` (latest: `checkpoint_cls.pth`, best EMA: `checkpoint_best_ema.pth`, best regular: `checkpoint_best_regular.pth`), and classification metrics are logged each epoch.
+
+## TODO
+
+- [ ] Publish pretrained classification checkpoints (Nano/Small/Medium) with reference metrics.
+- [ ] Add classification inference docs and examples using `RFDETRClassification*` and `.predict()` outputs.
+- [ ] Extend the ONNX/TensorRT export path to cover classification checkpoints and document supported flags.
+- [ ] Add a small automated regression test for the multi-label classification pipeline (e.g., tiny-ImageNet subset).
 
 ## Documentation
 

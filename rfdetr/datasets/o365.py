@@ -37,9 +37,21 @@ def build_o365_raw(image_set, args, resolution):
         square_resize_div_64 = False
 
     if square_resize_div_64:
-        dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms_square_div_64(image_set, resolution, multi_scale=args.multi_scale, expanded_scales=args.expanded_scales))
+        dataset = CocoDetection(
+            img_folder,
+            ann_file,
+            transforms=make_coco_transforms_square_div_64(image_set, resolution, multi_scale=args.multi_scale, expanded_scales=args.expanded_scales),
+            num_classes=args.num_classes,
+            multi_label=getattr(args, 'multi_label', False),
+        )
     else:
-        dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, resolution, multi_scale=args.multi_scale, expanded_scales=args.expanded_scales))
+        dataset = CocoDetection(
+            img_folder,
+            ann_file,
+            transforms=make_coco_transforms(image_set, resolution, multi_scale=args.multi_scale, expanded_scales=args.expanded_scales),
+            num_classes=args.num_classes,
+            multi_label=getattr(args, 'multi_label', False),
+        )
     return dataset
 
 

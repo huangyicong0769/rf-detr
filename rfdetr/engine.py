@@ -39,6 +39,109 @@ from typing import DefaultDict, List, Callable
 from rfdetr.util.misc import NestedTensor
 import numpy as np
 
+
+def _classification_metrics(all_logits, all_labels, thresholds=(0.5,)):
+    """Compute common multi-label classification metrics.
+
+    all_logits: [N, C] tensor
+    all_labels: [N, C] tensor of {0,1}
+    """
+    logits = torch.cat(all_logits, dim=0)
+    labels = torch.cat(all_labels, dim=0).float()
+    probs = logits.sigmoid()
+    num_classes = probs.shape[1]
+
+    def prf(thr):
+        preds = (probs >= thr).float()
+        tp = (preds * labels).sum(dim=0)
+        fp = (preds * (1 - labels)).sum(dim=0)
+        fn = ((1 - preds) * labels).sum(dim=0)
+
+        precision_c = tp / (tp + fp + 1e-9)
+        recall_c = tp / (tp + fn + 1e-9)
+
+        macro_p = precision_c.mean().item()
+        macro_r = recall_c.mean().item()
+        macro_f1 = (2 * macro_p * macro_r) / (macro_p + macro_r + 1e-9)
+
+        tp_micro = tp.sum()
+        fp_micro = fp.sum()
+        fn_micro = fn.sum()
+        micro_p = (tp_micro / (tp_micro + fp_micro + 1e-9)).item()
+        micro_r = (tp_micro / (tp_micro + fn_micro + 1e-9)).item()
+        micro_f1 = (2 * micro_p * micro_r) / (micro_p + micro_r + 1e-9)
+        return {
+            f'macro_precision@{thr}': macro_p,
+            f'macro_recall@{thr}': macro_r,
+            f'macro_f1@{thr}': macro_f1,
+            f'micro_precision@{thr}': micro_p,
+            f'micro_recall@{thr}': micro_r,
+            f'micro_f1@{thr}': micro_f1,
+            f'class_error@{thr}': (1.0 - micro_f1) * 100.0,
+        }
+
+    def average_precision():
+        aps = []
+        for c in range(num_classes):
+            scores = probs[:, c]
+            targets = labels[:, c]
+            pos_total = targets.sum()
+            if pos_total == 0:
+                aps.append(float("nan"))
+                continue
+            # sort desc by score
+            sorted_scores, idx = torch.sort(scores, descending=True)
+            sorted_targets = targets[idx]
+            tp = sorted_targets
+            fp = 1 - sorted_targets
+            tp_cum = torch.cumsum(tp, dim=0)
+            fp_cum = torch.cumsum(fp, dim=0)
+            precision = tp_cum / (tp_cum + fp_cum + 1e-9)
+            recall = tp_cum / (pos_total + 1e-9)
+            # prepend (0,1) for integration stability
+            precision = torch.cat([torch.tensor([1.0], device=precision.device), precision])
+            recall = torch.cat([torch.tensor([0.0], device=recall.device), recall])
+            ap = torch.trapz(precision, recall).item()
+            aps.append(ap)
+        valid_aps = [a for a in aps if not math.isnan(a)]
+        mAP = float(np.mean(valid_aps)) if len(valid_aps) > 0 else 0.0
+        return mAP, aps
+
+    def auroc():
+        aucs = []
+        for c in range(num_classes):
+            scores = probs[:, c]
+            targets = labels[:, c]
+            pos = targets.sum()
+            neg = (1 - targets).sum()
+            if pos == 0 or neg == 0:
+                aucs.append(float("nan"))
+                continue
+            sorted_scores, idx = torch.sort(scores, descending=True)
+            sorted_targets = targets[idx]
+            tps = torch.cumsum(sorted_targets, 0)
+            fps = torch.cumsum(1 - sorted_targets, 0)
+            tpr = tps / (pos + 1e-9)
+            fpr = fps / (neg + 1e-9)
+            tpr = torch.cat([torch.tensor([0.0], device=tpr.device), tpr])
+            fpr = torch.cat([torch.tensor([0.0], device=fpr.device), fpr])
+            auc = torch.trapz(tpr, fpr).item()
+            aucs.append(auc)
+        valid_aucs = [a for a in aucs if not math.isnan(a)]
+        macro_auc = float(np.mean(valid_aucs)) if len(valid_aucs) > 0 else 0.0
+        return macro_auc, aucs
+
+    metrics = {}
+    for thr in thresholds:
+        metrics.update(prf(thr))
+    mAP, per_class_ap = average_precision()
+    macro_auc, per_class_auc = auroc()
+    metrics['mAP'] = mAP
+    metrics['macro_auc'] = macro_auc
+    metrics['per_class_ap'] = per_class_ap
+    metrics['per_class_auc'] = per_class_auc
+    return metrics
+
 def get_autocast_args(args):
     if DEPRECATED_AMP:
         return {'enabled': args.amp, 'dtype': torch.bfloat16}
@@ -184,8 +287,9 @@ def coco_extended_metrics(coco_eval):
     """
 
     iou_thrs, rec_thrs = coco_eval.params.iouThrs, coco_eval.params.recThrs
-    iou50_idx, area_idx, maxdet_idx = (
-        int(np.argwhere(np.isclose(iou_thrs, 0.50))), 0, 2)
+    # np.argwhere returns an array; pick the first match index safely
+    iou50_idx_arr = np.flatnonzero(np.isclose(iou_thrs, 0.50))
+    iou50_idx, area_idx, maxdet_idx = (int(iou50_idx_arr[0]), 0, 2)
 
     P = coco_eval.eval["precision"]
     S = coco_eval.eval["scores"]
@@ -339,3 +443,156 @@ def evaluate(model, criterion, postprocess, data_loader, base_ds, device, args=N
             results_json = coco_extended_metrics(coco_evaluator.coco_eval["segm"])
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
     return stats, coco_evaluator
+
+
+def train_one_epoch_cls(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    args=None,
+    max_norm: float = 0,
+    ema_m: torch.nn.Module = None,
+    callbacks: DefaultDict[str, List[Callable]] | None = None,
+):
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    metric_logger.add_meter("class_error", utils.SmoothedValue(window_size=1, fmt="{value:.2f}"))
+    header = f"Epoch (cls): [{epoch}]"
+
+    model.train()
+    criterion.train()
+
+    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+        samples = samples.to(device)
+        targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()} for t in targets]
+
+        with autocast(**get_autocast_args(args)):
+            outputs = model(samples)
+            loss_dict = criterion(outputs, targets)
+            loss = loss_dict['loss_ce']
+
+        # micro-F1 based class error (@0.5) to mirror detection's class_error reporting
+        with torch.no_grad():
+            probs = outputs['logits'].sigmoid()
+            labels = torch.stack([t['labels_multi'] for t in targets], dim=0).float()
+            preds = (probs >= 0.5).float()
+            tp = (preds * labels).sum()
+            fp = (preds * (1 - labels)).sum()
+            fn = ((1 - preds) * labels).sum()
+            micro_p = tp / (tp + fp + 1e-9)
+            micro_r = tp / (tp + fn + 1e-9)
+            micro_f1 = (2 * micro_p * micro_r) / (micro_p + micro_r + 1e-9)
+            class_error = (1.0 - micro_f1) * 100.0
+
+        optimizer.zero_grad()
+        loss.backward()
+        if max_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.step()
+        if ema_m is not None:
+            ema_m.update(model)
+
+        metric_logger.update(loss=loss.item(), **{k: v.item() for k, v in loss_dict.items()})
+        metric_logger.update(class_error=class_error.item())
+        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats["train_loss"] = stats.get("loss")
+    stats["epoch"] = epoch
+    stats["flavor"] = "train"
+    if callbacks:
+        for callback in callbacks["on_fit_epoch_end"]:
+            callback(stats)
+    return stats
+
+
+@torch.no_grad()
+def evaluate_cls(model, criterion, data_loader, device, args=None, callbacks: DefaultDict[str, List[Callable]] | None = None, epoch: int | None = None, flavor: str = "base"):
+    model.eval()
+    criterion.eval()
+
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    header = "Test (cls):"
+
+    all_logits, all_labels = [], []
+
+    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+        samples = samples.to(device)
+        targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()} for t in targets]
+
+        with autocast(**get_autocast_args(args)):
+            outputs = model(samples)
+            loss_dict = criterion(outputs, targets)
+
+        with torch.no_grad():
+            probs = outputs['logits'].sigmoid()
+            labels = torch.stack([t['labels_multi'] for t in targets], dim=0).float()
+            preds = (probs >= 0.5).float()
+            tp = (preds * labels).sum()
+            fp = (preds * (1 - labels)).sum()
+            fn = ((1 - preds) * labels).sum()
+            micro_p = tp / (tp + fp + 1e-9)
+            micro_r = tp / (tp + fn + 1e-9)
+            micro_f1 = (2 * micro_p * micro_r) / (micro_p + micro_r + 1e-9)
+            class_error = (1.0 - micro_f1) * 100.0
+
+        metric_logger.update(loss=loss_dict['loss_ce'].item(), class_error=class_error.item())
+
+        all_logits.append(outputs['logits'].detach().cpu())
+        all_labels.append(torch.stack([t['labels_multi'].cpu() for t in targets], dim=0))
+
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+
+    stats = {"epoch": epoch if epoch is not None else -1}
+    stats.update({k: meter.global_avg for k, meter in metric_logger.meters.items()})
+    stats["test_loss"] = stats.get("loss")
+    stats["flavor"] = flavor
+    metrics = _classification_metrics(all_logits, all_labels, thresholds=(0.5,))
+    stats.update(metrics)
+
+    # Build results_json to mirror detection outputs
+    class_names = getattr(args, "class_names", None) or [str(i) for i in range(all_logits[0].shape[1])]
+    per_class_ap = metrics.get("per_class_ap", [])
+    per_class_auc = metrics.get("per_class_auc", [])
+    class_map = []
+    for idx, name in enumerate(class_names):
+        ap = per_class_ap[idx] if idx < len(per_class_ap) else float("nan")
+        auc = per_class_auc[idx] if idx < len(per_class_auc) else float("nan")
+        class_map.append({
+            "class": name,
+            "ap": ap,
+            "auc": auc,
+        })
+    class_map.append({
+        "class": "all",
+        "map": metrics.get("mAP", 0.0),
+        "macro_auc": metrics.get("macro_auc", 0.0),
+        "macro_precision@0.5": metrics.get("macro_precision@0.5", 0.0),
+        "macro_recall@0.5": metrics.get("macro_recall@0.5", 0.0),
+        "macro_f1@0.5": metrics.get("macro_f1@0.5", 0.0),
+        "micro_precision@0.5": metrics.get("micro_precision@0.5", 0.0),
+        "micro_recall@0.5": metrics.get("micro_recall@0.5", 0.0),
+        "micro_f1@0.5": metrics.get("micro_f1@0.5", 0.0),
+    })
+
+    stats["results_json"] = {
+        "class_map": class_map,
+        "map": metrics.get("mAP", 0.0),
+        "macro_auc": metrics.get("macro_auc", 0.0),
+        "macro_precision@0.5": metrics.get("macro_precision@0.5", 0.0),
+        "macro_recall@0.5": metrics.get("macro_recall@0.5", 0.0),
+        "macro_f1@0.5": metrics.get("macro_f1@0.5", 0.0),
+        "micro_precision@0.5": metrics.get("micro_precision@0.5", 0.0),
+        "micro_recall@0.5": metrics.get("micro_recall@0.5", 0.0),
+        "micro_f1@0.5": metrics.get("micro_f1@0.5", 0.0),
+    }
+    if callbacks:
+        for callback in callbacks["on_fit_epoch_end"]:
+            callback(stats)
+    return stats

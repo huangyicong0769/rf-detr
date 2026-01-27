@@ -321,6 +321,7 @@ class TransformerDecoder(nn.Module):
         self.return_intermediate = return_intermediate
         self.lite_refpoint_refine = lite_refpoint_refine
         self.bbox_reparam = bbox_reparam
+        self.bbox_embed = None  # set by LWDETR when box refinement is used
 
         self.ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
 
@@ -401,7 +402,7 @@ class TransformerDecoder(nn.Module):
                            spatial_shapes=spatial_shapes,
                            level_start_index=level_start_index)
 
-            if not self.lite_refpoint_refine:
+            if not self.lite_refpoint_refine and self.bbox_embed is not None:
                 # box iterative update
                 new_refpoints_delta = self.bbox_embed(output)
                 new_refpoints_unsigmoid = self.refpoints_refine(refpoints_unsigmoid, new_refpoints_delta)

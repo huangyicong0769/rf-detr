@@ -30,8 +30,14 @@ from rfdetr.config import (
     RFDETRSmallConfig,
     RFDETRMediumConfig,
     RFDETRSegPreviewConfig,
+    RFDETRClassificationBaseConfig,
+    RFDETRClassificationLargeConfig,
+    RFDETRClassificationNanoConfig,
+    RFDETRClassificationSmallConfig,
+    RFDETRClassificationMediumConfig,
     TrainConfig,
     SegmentationTrainConfig,
+    ClassificationTrainConfig,
     ModelConfig
 )
 from rfdetr.main import Model, download_pretrain_weights
@@ -67,7 +73,8 @@ class RFDETR:
         """
         Download pre-trained weights if they are not already downloaded.
         """
-        download_pretrain_weights(self.model_config.pretrain_weights)
+        if self.model_config.pretrain_weights:
+            download_pretrain_weights(self.model_config.pretrain_weights)
 
     def get_model_config(self, **kwargs):
         """
@@ -475,3 +482,126 @@ class RFDETRSegPreview(RFDETR):
 
     def get_train_config(self, **kwargs):
         return SegmentationTrainConfig(**kwargs)
+
+
+class RFDETRClassification(RFDETR):
+    """Multi-label image classification entrypoint using RF-DETR encoder+decoder."""
+    size = "rfdetr-base"
+
+    def get_model_config(self, **kwargs):
+        return RFDETRClassificationBaseConfig(**kwargs)
+
+    def get_train_config(self, **kwargs):
+        return ClassificationTrainConfig(**kwargs)
+
+    def train_from_config(self, config: TrainConfig, **kwargs):
+        if config.dataset_file == "coco":
+            root = getattr(config, "coco_path", None) or config.dataset_dir
+            if root is None:
+                raise ValueError("For COCO classification, set coco_path (preferred) or dataset_dir.")
+            ann_path = os.path.join(root, "annotations", "instances_train2017.json")
+        else:
+            ann_path = os.path.join(config.dataset_dir, "train", "_annotations.coco.json")
+
+        if not os.path.exists(ann_path):
+            print(f"Warning: training annotations not found at {ann_path}, proceeding may fail if file truly missing.")
+
+        with open(ann_path, "r") as f:
+            anns = json.load(f)
+        categories = anns.get("categories", [])
+        class_names = [c.get("name", str(c.get("id"))) for c in categories]
+        if not class_names:
+            raise ValueError("No categories found in training annotations for classification.")
+
+        num_classes = len(class_names)
+        self.model.class_names = class_names
+        if hasattr(self.model, "reinitialize_classification_head"):
+            self.model.reinitialize_classification_head(num_classes)
+
+        train_config = config.dict()
+        model_config = self.model_config.dict()
+
+        if "class_names" in train_config and train_config["class_names"] is None:
+            train_config["class_names"] = class_names
+
+        for k in list(model_config.keys()):
+            if k in train_config:
+                model_config.pop(k)
+            if k in kwargs:
+                kwargs.pop(k)
+
+        all_kwargs = {
+            **model_config,
+            **train_config,
+            **kwargs,
+            "num_classes": num_classes,
+            "task": "classification",
+        }
+
+        # Attach plotting/logging callbacks to mirror detection behavior
+        metrics_plot_sink = MetricsPlotSink(output_dir=config.output_dir)
+        self.callbacks["on_fit_epoch_end"].append(metrics_plot_sink.update)
+        self.callbacks["on_train_end"].append(metrics_plot_sink.save)
+
+        if config.tensorboard:
+            metrics_tensor_board_sink = MetricsTensorBoardSink(output_dir=config.output_dir)
+            self.callbacks["on_fit_epoch_end"].append(metrics_tensor_board_sink.update)
+            self.callbacks["on_train_end"].append(metrics_tensor_board_sink.close)
+
+        if config.wandb:
+            metrics_wandb_sink = MetricsWandBSink(
+                output_dir=config.output_dir,
+                project=config.project,
+                run=config.run,
+                config=config.model_dump()
+            )
+            self.callbacks["on_fit_epoch_end"].append(metrics_wandb_sink.update)
+            self.callbacks["on_train_end"].append(metrics_wandb_sink.close)
+
+        if config.early_stopping:
+            from rfdetr.util.early_stopping import EarlyStoppingCallback
+            early_stopping_callback = EarlyStoppingCallback(
+                model=self.model,
+                patience=config.early_stopping_patience,
+                min_delta=config.early_stopping_min_delta,
+                use_ema=config.early_stopping_use_ema,
+                segmentation_head=config.segmentation_head
+            )
+            self.callbacks["on_fit_epoch_end"].append(early_stopping_callback.update)
+
+        self.model.train(
+            **all_kwargs,
+            callbacks=self.callbacks,
+        )
+
+
+class RFDETRClassificationLarge(RFDETRClassification):
+    """Large encoder variant for classification."""
+    size = "rfdetr-large"
+
+    def get_model_config(self, **kwargs):
+        return RFDETRClassificationLargeConfig(**kwargs)
+
+
+class RFDETRClassificationNano(RFDETRClassification):
+    """Nano encoder variant for classification."""
+    size = "rfdetr-nano"
+
+    def get_model_config(self, **kwargs):
+        return RFDETRClassificationNanoConfig(**kwargs)
+
+
+class RFDETRClassificationSmall(RFDETRClassification):
+    """Small encoder variant for classification."""
+    size = "rfdetr-small"
+
+    def get_model_config(self, **kwargs):
+        return RFDETRClassificationSmallConfig(**kwargs)
+
+
+class RFDETRClassificationMedium(RFDETRClassification):
+    """Medium encoder variant for classification."""
+    size = "rfdetr-medium"
+
+    def get_model_config(self, **kwargs):
+        return RFDETRClassificationMediumConfig(**kwargs)

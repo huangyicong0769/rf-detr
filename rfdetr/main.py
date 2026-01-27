@@ -38,8 +38,14 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import rfdetr.util.misc as utils
 from rfdetr.datasets import build_dataset, get_coco_api_from_dataset
-from rfdetr.engine import evaluate, train_one_epoch
-from rfdetr.models import build_model, build_criterion_and_postprocessors, PostProcess
+from rfdetr.engine import evaluate, train_one_epoch, evaluate_cls, train_one_epoch_cls
+from rfdetr.models import (
+    build_model,
+    build_criterion_and_postprocessors,
+    PostProcess,
+    build_classification_model,
+    build_classification_criterion,
+)
 from rfdetr.util.benchmark import benchmark
 from rfdetr.util.drop_scheduler import drop_scheduler
 from rfdetr.util.files import download_file
@@ -64,6 +70,45 @@ HOSTED_MODELS = {
     "rf-detr-seg-preview.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-preview.pt",
 }
 
+
+def init_wandb_run(args):
+    if not args.wandb or not utils.is_main_process():
+        return None
+    try:
+        import wandb  # type: ignore
+        return wandb.init(
+            project=args.project or "rf-detr",
+            name=args.run,
+            config=vars(args),
+            reinit=True,
+        )
+    except Exception as e:
+        print(f"Failed to init Weights & Biases logging: {e}")
+        return None
+
+
+def log_jsonl(output_dir: Path, filename: str, payload: dict):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / filename).open("a") as f:
+        f.write(json.dumps(payload) + "\n")
+
+
+def save_checkpoint_cls(model_state, optimizer_state, epoch, args, output_dir: Path, best: bool = False, ema: bool = False):
+    if args.dont_save_weights:
+        return
+    if best and ema:
+        ckpt_name = "checkpoint_best_ema.pth"
+    elif best:
+        ckpt_name = "checkpoint_best_regular.pth"
+    else:
+        ckpt_name = "checkpoint_cls.pth"
+    utils.save_on_master({
+        'model': model_state,
+        'optimizer': optimizer_state,
+        'epoch': epoch,
+        'args': args,
+    }, output_dir / ckpt_name)
+
 def download_pretrain_weights(pretrain_weights: str, redownload=False):
     if pretrain_weights in HOSTED_MODELS:
         if redownload or not os.path.exists(pretrain_weights):
@@ -79,10 +124,14 @@ class Model:
     def __init__(self, **kwargs):
         args = populate_args(**kwargs)
         self.args = args
+        self.callbacks = None
         self.resolution = args.resolution
-        self.model = build_model(args)
+        if args.task == 'classification':
+            self.model = build_classification_model(args)
+        else:
+            self.model = build_model(args)
         self.device = torch.device(args.device)
-        if args.pretrain_weights is not None:
+        if args.pretrain_weights is not None and args.task != 'classification':
             print("Loading pretrain weights")
             try:
                 checkpoint = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
@@ -98,9 +147,10 @@ class Model:
                 self.args.class_names = checkpoint['args'].class_names
                 self.class_names = checkpoint['args'].class_names
 
-            checkpoint_num_classes = checkpoint['model']['class_embed.bias'].shape[0]
-            if checkpoint_num_classes != args.num_classes + 1:
-                self.reinitialize_detection_head(checkpoint_num_classes)
+            if args.task != 'classification':
+                checkpoint_num_classes = checkpoint['model']['class_embed.bias'].shape[0]
+                if checkpoint_num_classes != args.num_classes + 1:
+                    self.reinitialize_detection_head(checkpoint_num_classes)
             # add support to exclude_keys
             # e.g., when load object365 pretrain, do not load `class_embed.[weight, bias]`
             if args.pretrain_exclude_keys is not None:
@@ -149,11 +199,16 @@ class Model:
     def reinitialize_detection_head(self, num_classes):
         self.model.reinitialize_detection_head(num_classes)
 
+    def reinitialize_classification_head(self, num_classes):
+        if hasattr(self.model, "reinitialize_classification_head"):
+            self.model.reinitialize_classification_head(num_classes)
+
     def request_early_stop(self):
         self.stop_early = True
         print("Early stopping requested, will complete current epoch and stop")
 
     def train(self, callbacks: DefaultDict[str, List[Callable]], **kwargs):
+        self.callbacks = callbacks
         currently_supported_callbacks = ["on_fit_epoch_end", "on_train_batch_start", "on_train_end"]
         for key in callbacks.keys():
             if key not in currently_supported_callbacks:
@@ -177,9 +232,19 @@ class Model:
         np.random.seed(seed)
         random.seed(seed)
 
-        criterion, postprocess = build_criterion_and_postprocessors(args)
-        model = self.model
-        model.to(device)
+        if args.task == 'classification':
+            criterion = build_classification_criterion(args)
+            postprocess = None
+            model = self.model
+            model.to(device)
+            if hasattr(model, 'class_embed') and hasattr(self, 'reinitialize_classification_head'):
+                out_features = model.class_embed.out_features if hasattr(model.class_embed, 'out_features') else None
+                if out_features is not None and out_features != args.num_classes:
+                    self.reinitialize_classification_head(args.num_classes)
+        else:
+            criterion, postprocess = build_criterion_and_postprocessors(args)
+            model = self.model
+            model.to(device)
 
         model_without_ddp = model
         if args.distributed:
@@ -198,9 +263,148 @@ class Model:
                                     weight_decay=args.weight_decay)
         # Choose the learning rate scheduler based on the new argument
 
+        if args.task == 'classification':
+            dataset_train = build_dataset(image_set='train', args=args, resolution=args.resolution)
+            dataset_val = build_dataset(image_set='val', args=args, resolution=args.resolution)
+            dataset_test = build_dataset(
+                image_set='test' if (args.use_test_split or args.dataset_file != 'coco') else 'val',
+                args=args,
+                resolution=args.resolution,
+            )
+
+            if args.distributed:
+                sampler_train = DistributedSampler(dataset_train)
+                sampler_val = DistributedSampler(dataset_val, shuffle=False)
+                sampler_test = DistributedSampler(dataset_test, shuffle=False)
+            else:
+                sampler_train = torch.utils.data.RandomSampler(dataset_train)
+                sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+                sampler_test = torch.utils.data.SequentialSampler(dataset_test)
+
+            batch_sampler_train = torch.utils.data.BatchSampler(
+                sampler_train, args.batch_size, drop_last=True)
+            data_loader_train = DataLoader(
+                dataset_train,
+                batch_sampler=batch_sampler_train,
+                collate_fn=utils.collate_fn,
+                num_workers=args.num_workers
+            )
+
+            data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
+                                        drop_last=False, collate_fn=utils.collate_fn,
+                                        num_workers=args.num_workers)
+            data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
+                                         drop_last=False, collate_fn=utils.collate_fn,
+                                         num_workers=args.num_workers)
+
+            output_dir = Path(args.output_dir).expanduser().resolve()
+            best_metric_regular = 0.0
+            best_metric_ema = 0.0
+            best_val_stats_regular = None
+            best_val_stats_ema = None
+            ema_m = ModelEma(model_without_ddp, decay=args.ema_decay, tau=args.ema_tau) if args.use_ema else None
+
+            # optional W&B logging (main process only)
+            wandb_run = init_wandb_run(args)
+
+            for epoch in range(args.start_epoch, args.epochs):
+                if args.distributed:
+                    sampler_train.set_epoch(epoch)
+
+                train_stats = train_one_epoch_cls(
+                    model, criterion, data_loader_train, optimizer, device, epoch, args=args,
+                    max_norm=args.clip_max_norm, ema_m=ema_m, callbacks=self.callbacks,
+                )
+
+                val_stats = evaluate_cls(model, criterion, data_loader_val, device, args=args, callbacks=self.callbacks, epoch=epoch, flavor="base")
+                ema_val_stats = None
+                if ema_m is not None:
+                    ema_val_stats = evaluate_cls(ema_m.module, criterion, data_loader_val, device, args=args, callbacks=self.callbacks, epoch=epoch, flavor="ema")
+                if utils.is_main_process():
+                    print(f"val_stats: {val_stats}")
+                    if ema_val_stats is not None:
+                        print(f"val_stats_ema: {ema_val_stats}")
+                current_metric = val_stats.get('mAP', 0.0)
+                current_metric_ema = ema_val_stats.get('mAP', 0.0) if ema_val_stats else 0.0
+                is_best_regular = current_metric > best_metric_regular
+                is_best_ema = current_metric_ema > best_metric_ema
+                best_metric_regular = max(best_metric_regular, current_metric)
+                best_metric_ema = max(best_metric_ema, current_metric_ema)
+                if is_best_regular:
+                    best_val_stats_regular = val_stats
+                if is_best_ema:
+                    best_val_stats_ema = ema_val_stats
+
+                log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                            **{f'val_{k}': v for k, v in val_stats.items()},
+                            'epoch': epoch,
+                            'n_parameters': n_parameters}
+                if ema_val_stats is not None:
+                    log_stats.update({f'val_ema_{k}': v for k, v in ema_val_stats.items()})
+
+                if wandb_run is not None:
+                    try:
+                        wandb_run.log(log_stats)
+                    except Exception as e:
+                        print(f"wandb log failed at epoch {epoch}: {e}")
+
+                if args.output_dir:
+                    log_jsonl(output_dir, "log.txt", log_stats)
+                    save_checkpoint_cls(model_without_ddp.state_dict(), optimizer.state_dict(), epoch, args, output_dir, best=False)
+                    if is_best_regular:
+                        save_checkpoint_cls(model_without_ddp.state_dict(), optimizer.state_dict(), epoch, args, output_dir, best=True, ema=False)
+                    if is_best_ema and ema_m is not None:
+                        save_checkpoint_cls(ema_m.module.state_dict(), optimizer.state_dict(), epoch, args, output_dir, best=True, ema=True)
+                if self.stop_early:
+                    break
+
+            # final test evaluation (uses val split for coco, since official test has no labels)
+            best_is_ema = best_metric_ema > best_metric_regular and ema_m is not None and (output_dir / "checkpoint_best_ema.pth").exists()
+            best_ckpt_path = output_dir / ("checkpoint_best_ema.pth" if best_is_ema else "checkpoint_best_regular.pth")
+            if args.output_dir and best_ckpt_path.exists():
+                best_state = torch.load(best_ckpt_path, map_location='cpu', weights_only=False)['model']
+                model_without_ddp.load_state_dict(best_state)
+                model.load_state_dict(best_state)
+                model.eval()
+
+            # use epoch index for test callbacks to satisfy metrics sinks
+            test_stats = evaluate_cls(model, criterion, data_loader_test, device, args=args, callbacks=self.callbacks, epoch=args.epochs, flavor="base")
+            if utils.is_main_process():
+                print(f"test_stats: {test_stats}")
+            if args.output_dir:
+                log_jsonl(output_dir, "log_test.txt", test_stats)
+                # persist results.json aligned with detection flow
+                val_results = (best_val_stats_ema if best_is_ema else best_val_stats_regular) or val_stats
+                val_results = val_results.get("results_json", {})
+                test_results = test_stats.get("results_json", {})
+                results = {"class_map": {"valid": val_results.get("class_map", []), "test": test_results.get("class_map", [])}}
+                with open(output_dir / "results.json", "w") as f:
+                    json.dump(results, f)
+                # best_total artifact for downstream use
+                if best_ckpt_path.exists():
+                    shutil.copy2(best_ckpt_path, output_dir / "checkpoint_best_total.pth")
+                    utils.strip_checkpoint(output_dir / "checkpoint_best_total.pth")
+            if wandb_run is not None:
+                try:
+                    wandb_run.log({f'test_{k}': v for k, v in test_stats.items()})
+                except Exception as e:
+                    print(f"wandb log failed on test: {e}")
+                wandb_run.finish()
+
+            # fire on_train_end callbacks (e.g., metrics plotting) for classification
+            if self.callbacks and "on_train_end" in self.callbacks:
+                for callback in self.callbacks["on_train_end"]:
+                    callback()
+
+            return
+
         dataset_train = build_dataset(image_set='train', args=args, resolution=args.resolution)
         dataset_val = build_dataset(image_set='val', args=args, resolution=args.resolution)
-        dataset_test = build_dataset(image_set='test' if args.dataset_file == "roboflow" else "val", args=args, resolution=args.resolution)
+        dataset_test = build_dataset(
+            image_set='test' if (args.use_test_split or args.dataset_file == "roboflow") else "val",
+            args=args,
+            resolution=args.resolution,
+        )
 
         # for cosine annealing, calculate total training steps and warmup steps
         total_batch_size_for_lr = args.batch_size * utils.get_world_size() * args.grad_accum_steps
@@ -440,8 +644,7 @@ class Model:
             epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))
             log_stats['epoch_time'] = epoch_time_str
             if args.output_dir and utils.is_main_process():
-                with (output_dir / "log.txt").open("a") as f:
-                    f.write(json.dumps(log_stats) + "\n")
+                log_jsonl(output_dir, "log.txt", log_stats)
 
                 # for evaluation logs
                 if coco_evaluator is not None:
@@ -675,6 +878,7 @@ if __name__ == '__main__':
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
+    parser.add_argument('--task', default='detection', choices=['detection', 'classification'], help='Training task')
     parser.add_argument('--num_classes', default=2, type=int)
     parser.add_argument('--grad_accum_steps', default=1, type=int)
     parser.add_argument('--amp', default=False, type=bool)
@@ -779,9 +983,12 @@ def get_args_parser():
     parser.add_argument('--use_varifocal_loss', action='store_true')
     parser.add_argument('--use_position_supervised_loss', action='store_true')
     parser.add_argument('--ia_bce_loss', action='store_true')
+    parser.add_argument('--multi_label', action='store_true', help='Enable multi-label classification (sigmoid + BCE)')
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
+    parser.add_argument('--use_test_split', action='store_true',
+                        help='Use test split when available (for custom COCO-style data)')
     parser.add_argument('--coco_path', type=str)
     parser.add_argument('--dataset_dir', type=str)
     parser.add_argument('--square_resize_div_64', action='store_true')
@@ -862,6 +1069,7 @@ def get_args_parser():
     return parser
 
 def populate_args(
+    task='detection',
     # Basic training parameters
     num_classes=2,
     grad_accum_steps=1,
@@ -935,9 +1143,11 @@ def populate_args(
     use_varifocal_loss=False,
     use_position_supervised_loss=False,
     ia_bce_loss=False,
+    multi_label=False,
 
     # Dataset parameters
     dataset_file='coco',
+    use_test_split=False,
     coco_path=None,
     dataset_dir=None,
     square_resize_div_64=False,
@@ -986,6 +1196,7 @@ def populate_args(
     **extra_kwargs  # To handle any unexpected arguments
 ):
     args = argparse.Namespace(
+        task=task,
         num_classes=num_classes,
         grad_accum_steps=grad_accum_steps,
         amp=amp,
@@ -1046,7 +1257,9 @@ def populate_args(
         use_varifocal_loss=use_varifocal_loss,
         use_position_supervised_loss=use_position_supervised_loss,
         ia_bce_loss=ia_bce_loss,
+        multi_label=multi_label,
         dataset_file=dataset_file,
+        use_test_split=use_test_split,
         coco_path=coco_path,
         dataset_dir=dataset_dir,
         square_resize_div_64=square_resize_div_64,

@@ -37,7 +37,8 @@ class HungarianMatcher(nn.Module):
     """
 
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, focal_alpha: float = 0.25, use_pos_only: bool = False,
-                 use_position_modulated_cost: bool = False, mask_point_sample_ratio: int = 16, cost_mask_ce: float = 1, cost_mask_dice: float = 1):
+                 use_position_modulated_cost: bool = False, mask_point_sample_ratio: int = 16, cost_mask_ce: float = 1, cost_mask_dice: float = 1,
+                 multi_label: bool = False, num_classes: int = None):
         """Creates the matcher
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
@@ -53,6 +54,8 @@ class HungarianMatcher(nn.Module):
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
         self.cost_mask_dice = cost_mask_dice
+        self.multi_label = multi_label
+        self.num_classes = num_classes
 
     @torch.no_grad()
     def forward(self, outputs, targets, group_detr=1):
@@ -82,7 +85,6 @@ class HungarianMatcher(nn.Module):
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
 
         # Also concat the target labels and boxes
-        tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_bbox = torch.cat([v["boxes"] for v in targets])
 
         masks_present = "masks" in targets[0]
@@ -96,15 +98,29 @@ class HungarianMatcher(nn.Module):
         cost_giou = -giou
 
         # Compute the classification cost.
-        alpha = 0.25
-        gamma = 2.0
+        if self.multi_label:
+            if self.num_classes is None:
+                self.num_classes = flat_pred_logits.shape[-1]
+            tgt_multi_labels = []
+            for v in targets:
+                if "multi_labels" in v:
+                    tgt_multi_labels.append(v["multi_labels"].float())
+                else:
+                    tgt_multi_labels.append(F.one_hot(v["labels"], num_classes=self.num_classes).float())
+            tgt_multi_labels = torch.cat(tgt_multi_labels, dim=0)
+            cost_class = F.binary_cross_entropy_with_logits(
+                flat_pred_logits.unsqueeze(1).expand(-1, tgt_multi_labels.shape[0], -1),
+                tgt_multi_labels.unsqueeze(0).expand(flat_pred_logits.shape[0], -1, -1),
+                reduction="none",
+            ).mean(-1)
+        else:
+            tgt_ids = torch.cat([v["labels"] for v in targets])
+            alpha = 0.25
+            gamma = 2.0
 
-        # neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
-        # pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
-        # we refactor these with logsigmoid for numerical stability
-        neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-F.logsigmoid(-flat_pred_logits))
-        pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-F.logsigmoid(flat_pred_logits))
-        cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+            neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-F.logsigmoid(-flat_pred_logits))
+            pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-F.logsigmoid(flat_pred_logits))
+            cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
 
         # Compute the L1 cost between boxes
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
@@ -161,6 +177,7 @@ class HungarianMatcher(nn.Module):
 
 
 def build_matcher(args):
+    num_classes = args.num_classes if getattr(args, 'multi_label', False) else args.num_classes + 1
     if args.segmentation_head:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
@@ -169,11 +186,15 @@ def build_matcher(args):
             focal_alpha=args.focal_alpha,
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
-            mask_point_sample_ratio=args.mask_point_sample_ratio,)
+            mask_point_sample_ratio=args.mask_point_sample_ratio,
+            multi_label=getattr(args, 'multi_label', False),
+            num_classes=num_classes,)
     else:
         return HungarianMatcher(
             cost_class=args.set_cost_class,
             cost_bbox=args.set_cost_bbox,
             cost_giou=args.set_cost_giou,
             focal_alpha=args.focal_alpha,
+            multi_label=getattr(args, 'multi_label', False),
+            num_classes=num_classes,
         )

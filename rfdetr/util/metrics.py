@@ -22,6 +22,12 @@ def safe_index(arr, idx):
     return arr[idx] if 0 <= idx < len(arr) else None
 
 
+def align_xy(x_arr, y_arr):
+    """Trim series to the shared length for plotting safety."""
+    n = min(len(x_arr), len(y_arr))
+    return x_arr[:n], y_arr[:n]
+
+
 class MetricsPlotSink:
     """
     The MetricsPlotSink class records training metrics and saves them to a plot.
@@ -42,71 +48,132 @@ class MetricsPlotSink:
             print("No data to plot.")
             return
 
-        def get_array(key):
-            return np.array([h[key] for h in self.history if key in h])
+        base_hist = [h for h in self.history if h.get("flavor", "base") != "ema"]
+        ema_hist = [h for h in self.history if h.get("flavor") == "ema"]
 
-        epochs = get_array('epoch')
-        train_loss = get_array('train_loss')
-        test_loss = get_array('test_loss')
-        test_coco_eval = [h['test_coco_eval_bbox'] for h in self.history if 'test_coco_eval_bbox' in h]
-        ap50_90 = np.array([safe_index(x, 0) for x in test_coco_eval if x is not None], dtype=np.float32)
-        ap50 = np.array([safe_index(x, 1) for x in test_coco_eval if x is not None], dtype=np.float32)
-        ar50_90 = np.array([safe_index(x, 8) for x in test_coco_eval if x is not None], dtype=np.float32)
+        def get_array(hist, key):
+            return np.array([h[key] for h in hist if key in h])
 
-        ema_coco_eval = [h['ema_test_coco_eval_bbox'] for h in self.history if 'ema_test_coco_eval_bbox' in h]
-        ema_ap50_90 = np.array([safe_index(x, 0) for x in ema_coco_eval if x is not None], dtype=np.float32)
-        ema_ap50 = np.array([safe_index(x, 1) for x in ema_coco_eval if x is not None], dtype=np.float32)
-        ema_ar50_90 = np.array([safe_index(x, 8) for x in ema_coco_eval if x is not None], dtype=np.float32)
+        epochs = get_array(base_hist, 'epoch')
+        train_loss = get_array(base_hist, 'train_loss')
+        val_loss = get_array(base_hist, 'test_loss')
+
+        has_det = any('test_coco_eval_bbox' in h for h in base_hist) or any('test_coco_eval_bbox' in h for h in ema_hist)
+        has_cls = any('mAP' in h for h in base_hist) or any('mAP' in h for h in ema_hist)
+
+        test_coco_eval_base = [h['test_coco_eval_bbox'] for h in base_hist if 'test_coco_eval_bbox' in h]
+        ap50_90 = np.array([safe_index(x, 0) for x in test_coco_eval_base if x is not None], dtype=np.float32)
+        ap50 = np.array([safe_index(x, 1) for x in test_coco_eval_base if x is not None], dtype=np.float32)
+        ar50_90 = np.array([safe_index(x, 8) for x in test_coco_eval_base if x is not None], dtype=np.float32)
+
+        test_coco_eval_ema = [h['test_coco_eval_bbox'] for h in ema_hist if 'test_coco_eval_bbox' in h]
+        ema_ap50_90 = np.array([safe_index(x, 0) for x in test_coco_eval_ema if x is not None], dtype=np.float32)
+        ema_ap50 = np.array([safe_index(x, 1) for x in test_coco_eval_ema if x is not None], dtype=np.float32)
+        ema_ar50_90 = np.array([safe_index(x, 8) for x in test_coco_eval_ema if x is not None], dtype=np.float32)
 
         fig, axes = plt.subplots(2, 2, figsize=(18, 12))
 
         # Subplot (0,0): Training and Validation Loss
         if len(epochs) > 0:
             if len(train_loss):
-                axes[0][0].plot(epochs, train_loss, label='Training Loss', marker='o', linestyle='-')
-            if len(test_loss):
-                axes[0][0].plot(epochs, test_loss, label='Validation Loss', marker='o', linestyle='--')
-            axes[0][0].set_title('Training and Validation Loss')
+                x, y = align_xy(epochs, train_loss)
+                axes[0][0].plot(x, y, label='Training Loss', marker='o', linestyle='-')
+            if len(val_loss):
+                x, y = align_xy(epochs, val_loss)
+                axes[0][0].plot(x, y, label='Validation Loss', marker='o', linestyle='--')
+            axes[0][0].set_title('Loss')
             axes[0][0].set_xlabel('Epoch Number')
             axes[0][0].set_ylabel('Loss Value')
             axes[0][0].legend()
             axes[0][0].grid(True)
 
-        # Subplot (0,1): Average Precision @0.50
-        if ap50.size > 0 or ema_ap50.size > 0:
-            if ap50.size > 0:
-                axes[0][1].plot(epochs[:len(ap50)], ap50, marker='o', linestyle='-', label='Base Model')
-            if ema_ap50.size > 0:
-                axes[0][1].plot(epochs[:len(ema_ap50)], ema_ap50, marker='o', linestyle='--', label='EMA Model')
-            axes[0][1].set_title('Average Precision @0.50')
-            axes[0][1].set_xlabel('Epoch Number')
-            axes[0][1].set_ylabel('AP50')
-            axes[0][1].legend()
-            axes[0][1].grid(True)
+        # Detection or classification plots, one metric per panel with base vs EMA
+        if has_det:
+            if ap50.size > 0 or ema_ap50.size > 0:
+                if ap50.size > 0:
+                    x, y = align_xy(epochs, ap50)
+                    axes[0][1].plot(x, y, marker='o', linestyle='-', label='Base')
+                if ema_ap50.size > 0:
+                    x, y = align_xy(epochs, ema_ap50)
+                    axes[0][1].plot(x, y, marker='o', linestyle='--', label='EMA')
+                axes[0][1].set_title('AP50')
+                axes[0][1].set_xlabel('Epoch')
+                axes[0][1].set_ylabel('AP50')
+                axes[0][1].legend()
+                axes[0][1].grid(True)
 
-        # Subplot (1,0): Average Precision @0.50:0.95
-        if ap50_90.size > 0 or ema_ap50_90.size > 0:
-            if ap50_90.size > 0:
-                axes[1][0].plot(epochs[:len(ap50_90)], ap50_90, marker='o', linestyle='-', label='Base Model')
-            if ema_ap50_90.size > 0:
-                axes[1][0].plot(epochs[:len(ema_ap50_90)], ema_ap50_90, marker='o', linestyle='--', label='EMA Model')
-            axes[1][0].set_title('Average Precision @0.50:0.95')
-            axes[1][0].set_xlabel('Epoch Number')
-            axes[1][0].set_ylabel('AP')
-            axes[1][0].legend()
-            axes[1][0].grid(True)
+            if ap50_90.size > 0 or ema_ap50_90.size > 0:
+                if ap50_90.size > 0:
+                    x, y = align_xy(epochs, ap50_90)
+                    axes[1][0].plot(x, y, marker='o', linestyle='-', label='Base')
+                if ema_ap50_90.size > 0:
+                    x, y = align_xy(epochs, ema_ap50_90)
+                    axes[1][0].plot(x, y, marker='o', linestyle='--', label='EMA')
+                axes[1][0].set_title('AP50-95')
+                axes[1][0].set_xlabel('Epoch')
+                axes[1][0].set_ylabel('AP')
+                axes[1][0].legend()
+                axes[1][0].grid(True)
 
-        # Subplot (1,1): Average Recall @0.50:0.95
-        if ar50_90.size > 0 or ema_ar50_90.size > 0:
-            if ar50_90.size > 0:
-                axes[1][1].plot(epochs[:len(ar50_90)], ar50_90, marker='o', linestyle='-', label='Base Model')
-            if ema_ar50_90.size > 0:
-                axes[1][1].plot(epochs[:len(ema_ar50_90)], ema_ar50_90, marker='o', linestyle='--', label='EMA Model')
-            axes[1][1].set_title('Average Recall @0.50:0.95')
-            axes[1][1].set_xlabel('Epoch Number')
-            axes[1][1].set_ylabel('AR')
-            axes[1][1].legend()
-            axes[1][1].grid(True)
+            if ar50_90.size > 0 or ema_ar50_90.size > 0:
+                if ar50_90.size > 0:
+                    x, y = align_xy(epochs, ar50_90)
+                    axes[1][1].plot(x, y, marker='o', linestyle='-', label='Base')
+                if ema_ar50_90.size > 0:
+                    x, y = align_xy(epochs, ema_ar50_90)
+                    axes[1][1].plot(x, y, marker='o', linestyle='--', label='EMA')
+                axes[1][1].set_title('AR50-95')
+                axes[1][1].set_xlabel('Epoch')
+                axes[1][1].set_ylabel('AR')
+                axes[1][1].legend()
+                axes[1][1].grid(True)
+
+        if has_cls:
+            mAP_base = get_array(base_hist, 'mAP')
+            mAP_ema = get_array(ema_hist, 'mAP')
+            macro_auc_base = get_array(base_hist, 'macro_auc')
+            macro_auc_ema = get_array(ema_hist, 'macro_auc')
+            micro_f1_base = get_array(base_hist, 'micro_f1@0.5')
+            micro_f1_ema = get_array(ema_hist, 'micro_f1@0.5')
+
+            if len(mAP_base) or len(mAP_ema):
+                if len(mAP_base):
+                    x, y = align_xy(epochs, mAP_base)
+                    axes[0][1].plot(x, y, marker='o', linestyle='-', label='Base')
+                if len(mAP_ema):
+                    x, y = align_xy(epochs, mAP_ema)
+                    axes[0][1].plot(x, y, marker='o', linestyle='--', label='EMA')
+                axes[0][1].set_title('mAP')
+                axes[0][1].set_xlabel('Epoch')
+                axes[0][1].set_ylabel('mAP')
+                axes[0][1].legend()
+                axes[0][1].grid(True)
+
+            if len(macro_auc_base) or len(macro_auc_ema):
+                if len(macro_auc_base):
+                    x, y = align_xy(epochs, macro_auc_base)
+                    axes[1][0].plot(x, y, marker='o', linestyle='-', label='Base')
+                if len(macro_auc_ema):
+                    x, y = align_xy(epochs, macro_auc_ema)
+                    axes[1][0].plot(x, y, marker='o', linestyle='--', label='EMA')
+                axes[1][0].set_title('Macro AUC')
+                axes[1][0].set_xlabel('Epoch')
+                axes[1][0].set_ylabel('AUC')
+                axes[1][0].legend()
+                axes[1][0].grid(True)
+
+            if len(micro_f1_base) or len(micro_f1_ema):
+                if len(micro_f1_base):
+                    x, y = align_xy(epochs, micro_f1_base)
+                    axes[1][1].plot(x, y, marker='o', linestyle='-', label='Base')
+                if len(micro_f1_ema):
+                    x, y = align_xy(epochs, micro_f1_ema)
+                    axes[1][1].plot(x, y, marker='o', linestyle='--', label='EMA')
+                axes[1][1].set_title('Micro F1@0.5')
+                axes[1][1].set_xlabel('Epoch')
+                axes[1][1].set_ylabel('F1')
+                axes[1][1].legend()
+                axes[1][1].grid(True)
 
         plt.tight_layout()
         plt.savefig(f"{self.output_dir}/{PLOT_FILE_NAME}")

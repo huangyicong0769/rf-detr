@@ -13,9 +13,8 @@
 import torch.utils.data
 import torchvision
 
-from .coco import build as build_coco
+from .coco import build as build_coco, build_coco_classification, build_roboflow
 from .o365 import build_o365
-from .coco import build_roboflow
 
 
 def get_coco_api_from_dataset(dataset):
@@ -27,6 +26,11 @@ def get_coco_api_from_dataset(dataset):
 
 
 def build_dataset(image_set, args, resolution):
+    if getattr(args, 'task', 'detection') == 'classification':
+        if args.dataset_file == 'coco':
+            return build_coco_classification(image_set, args, resolution)
+        raise ValueError(f'classification task currently supports only coco dataset_file, got {args.dataset_file}')
+
     if args.dataset_file == 'coco':
         return build_coco(image_set, args, resolution)
     if args.dataset_file == 'o365':
