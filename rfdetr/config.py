@@ -5,9 +5,12 @@
 # ------------------------------------------------------------------------
 
 
-from pydantic import BaseModel
-from typing import List, Optional, Literal, Type
+import os
+from typing import List, Literal, Optional
+
 import torch
+from pydantic import BaseModel, field_validator
+
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 class ModelConfig(BaseModel):
@@ -39,6 +42,18 @@ class ModelConfig(BaseModel):
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
     multi_label: bool = False
+    license: str = "Apache-2.0"
+
+    @field_validator("pretrain_weights", mode="after")
+    @classmethod
+    def expand_path(cls, v: Optional[str]) -> Optional[str]:
+        """
+        Expand user paths (e.g., '~' or paths with separators) but leave simple filenames
+        (like 'rf-detr-base.pth') unchanged so they can match hosted model keys.
+        """
+        if v is None:
+            return v
+        return os.path.realpath(os.path.expanduser(v))
 
 
 class RFDETRBaseConfig(ModelConfig):
@@ -61,7 +76,7 @@ class RFDETRBaseConfig(ModelConfig):
     resolution: int = 560
     positional_encoding_size: int = 37
 
-class RFDETRLargeConfig(RFDETRBaseConfig):
+class RFDETRLargeDeprecatedConfig(RFDETRBaseConfig):
     """
     The configuration for an RF-DETR Large model.
     """
@@ -109,6 +124,26 @@ class RFDETRMediumConfig(RFDETRBaseConfig):
     positional_encoding_size: int = 36
     pretrain_weights: Optional[str] = "rf-detr-medium.pth"
 
+
+#res 704, ps 16, 2 windows, 4 dec layers, 300 queries, ViT-S basis
+class RFDETRLargeConfig(ModelConfig):
+    encoder: Literal["dinov2_windowed_small"] = "dinov2_windowed_small"
+    hidden_dim: int = 256
+    dec_layers: int = 4
+    sa_nheads: int = 8
+    ca_nheads: int = 16
+    dec_n_points: int = 2
+    num_windows: int = 2
+    patch_size: int = 16
+    projector_scale: List[Literal["P4",]] = ["P4"]
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    num_classes: int = 90
+    positional_encoding_size: int = 704 // 16
+    pretrain_weights: Optional[str] = "rf-detr-large-2026.pth"
+    resolution: int = 704
+
+
+
 class RFDETRSegPreviewConfig(RFDETRBaseConfig):
     segmentation_head: bool = True
     out_feature_indexes: List[int] = [3, 6, 9, 12]
@@ -120,6 +155,90 @@ class RFDETRSegPreviewConfig(RFDETRBaseConfig):
     num_queries: int = 200
     num_select: int = 200
     pretrain_weights: Optional[str] = "rf-detr-seg-preview.pt"
+    num_classes: int = 90
+
+
+class RFDETRSegNanoConfig(RFDETRBaseConfig):
+    segmentation_head: bool = True
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    num_windows: int = 1
+    dec_layers: int = 4
+    patch_size: int = 12
+    resolution: int = 312
+    positional_encoding_size: int = 312 // 12
+    num_queries: int = 100
+    num_select: int = 100
+    pretrain_weights: Optional[str] = "rf-detr-seg-nano.pt"
+    num_classes: int = 90
+
+
+class RFDETRSegSmallConfig(RFDETRBaseConfig):
+    segmentation_head: bool = True
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    num_windows: int = 2
+    dec_layers: int = 4
+    patch_size: int = 12
+    resolution: int = 384
+    positional_encoding_size: int = 384 // 12
+    num_queries: int = 100
+    num_select: int = 100
+    pretrain_weights: Optional[str] = "rf-detr-seg-small.pt"
+    num_classes: int = 90
+
+
+class RFDETRSegMediumConfig(RFDETRBaseConfig):
+    segmentation_head: bool = True
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    num_windows: int = 2
+    dec_layers: int = 5
+    patch_size: int = 12
+    resolution: int = 432
+    positional_encoding_size: int = 432 // 12
+    num_queries: int = 200
+    num_select: int = 200
+    pretrain_weights: Optional[str] = "rf-detr-seg-medium.pt"
+    num_classes: int = 90
+
+
+class RFDETRSegLargeConfig(RFDETRBaseConfig):
+    segmentation_head: bool = True
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    num_windows: int = 2
+    dec_layers: int = 5
+    patch_size: int = 12
+    resolution: int = 504
+    positional_encoding_size: int = 504 // 12
+    num_queries: int = 200
+    num_select: int = 200
+    pretrain_weights: Optional[str] = "rf-detr-seg-large.pt"
+    num_classes: int = 90
+
+
+class RFDETRSegXLargeConfig(RFDETRBaseConfig):
+    segmentation_head: bool = True
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    num_windows: int = 2
+    dec_layers: int = 6
+    patch_size: int = 12
+    resolution: int = 624
+    positional_encoding_size: int = 624 // 12
+    num_queries: int = 300
+    num_select: int = 300
+    pretrain_weights: Optional[str] = "rf-detr-seg-xlarge.pt"
+    num_classes: int = 90
+
+
+class RFDETRSeg2XLargeConfig(RFDETRBaseConfig):
+    segmentation_head: bool = True
+    out_feature_indexes: List[int] = [3, 6, 9, 12]
+    num_windows: int = 2
+    dec_layers: int = 6
+    patch_size: int = 12
+    resolution: int = 768
+    positional_encoding_size: int = 768 // 12
+    num_queries: int = 300
+    num_select: int = 300
+    pretrain_weights: Optional[str] = "rf-detr-seg-xxlarge.pt"
     num_classes: int = 90
 
 
@@ -163,6 +282,7 @@ class TrainConfig(BaseModel):
     batch_size: int = 4
     grad_accum_steps: int = 4
     epochs: int = 100
+    resume: Optional[str] = None
     ema_decay: float = 0.993
     ema_tau: int = 100
     lr_drop: int = 100
@@ -175,7 +295,7 @@ class TrainConfig(BaseModel):
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
     num_select: int = 300
-    dataset_file: Literal["coco", "o365", "roboflow"] = "roboflow"
+    dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
     square_resize_div_64: bool = True
     dataset_dir: str
     output_dir: str = "output"
@@ -198,6 +318,18 @@ class TrainConfig(BaseModel):
     segmentation_head: bool = False
     multi_label: bool = False
     use_test_split: bool = False
+    eval_max_dets: int = 500
+
+    @field_validator("dataset_dir", "output_dir", mode="after")
+    @classmethod
+    def expand_paths(cls, v: str) -> str:
+        """
+        Expand user paths (e.g., '~' or paths with separators) but leave simple filenames
+        (like 'rf-detr-base.pth') unchanged so they can match hosted model keys.
+        """
+        if v is None:
+            return v
+        return os.path.realpath(os.path.expanduser(v))
 
 
 class SegmentationTrainConfig(TrainConfig):

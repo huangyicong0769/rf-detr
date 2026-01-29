@@ -14,34 +14,26 @@ reliable measurements of inference latency using ONNX Runtime or TensorRT
 on the device.
 """
 import argparse
-import copy
 import contextlib
-import datetime
+import copy
 import json
 import os
 import os.path as osp
 import random
 import time
-import ast
-from pathlib import Path
-from collections import namedtuple, OrderedDict
-
-from pycocotools.cocoeval import COCOeval
-from pycocotools.coco import COCO
-import pycocotools.mask as mask_util
+from collections import OrderedDict, namedtuple
 
 import numpy as np
-from PIL import Image
+import onnxruntime as nxrun
+import pycuda.driver as cuda
+import supervision as sv
+import tensorrt as trt
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
-import torchvision.transforms as T
 import torchvision.transforms.functional as F
 import tqdm
-
-import pycuda.driver as cuda
-import pycuda.autoinit
-import onnxruntime as nxrun
-import tensorrt as trt
+from PIL import Image
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
 
 
 def parser_args():
@@ -115,7 +107,7 @@ class CocoEvaluator(object):
                 continue
 
             boxes = prediction["boxes"]
-            boxes = convert_to_xywh(boxes).tolist()
+            boxes = sv.xyxy_to_xywh(boxes.cpu().numpy()).tolist()
             scores = prediction["scores"].tolist()
             labels = prediction["labels"].tolist()
 
@@ -184,9 +176,6 @@ def evaluate(self):
     self._paramsEval = copy.deepcopy(self.params)
     return p.imgIds, evalImgs
 
-def convert_to_xywh(boxes):
-    boxes[:, 2:] -= boxes[:, :2]
-    return boxes
 
 
 def get_image_list(ann_file):
@@ -362,8 +351,8 @@ def infer_engine(model, coco_evaluator, time_profile, prefix, img_list, device, 
 
         samples = image_tensor[None].to(device)
         _, _, h, w = samples.shape
-        im_shape = torch.Tensor(np.array([h, w]).reshape((1, 2)).astype(np.float32)).to(device)
-        scale_factor = torch.Tensor(np.array([h / height, w / width]).reshape((1, 2)).astype(np.float32)).to(device)
+        # torch.Tensor(np.array([h, w]).reshape((1, 2)).astype(np.float32)).to(device)
+        # torch.Tensor(np.array([h / height, w / width]).reshape((1, 2)).astype(np.float32)).to(device)
 
         time_profile.reset()
         with time_profile:

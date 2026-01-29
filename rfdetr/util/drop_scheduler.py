@@ -4,10 +4,19 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 """util for drop scheduler."""
+from typing import Literal
+
 import numpy as np
 
 
-def drop_scheduler(drop_rate, epochs, niter_per_ep, cutoff_epoch=0, mode='standard', schedule='constant'):
+def drop_scheduler(
+    drop_rate: float,
+    epochs: int,
+    niter_per_ep: int,
+    cutoff_epoch: int = 0,
+    mode: Literal['standard', 'early', 'late'] = 'standard',
+    schedule: Literal['constant', 'linear'] = 'constant',
+) -> np.ndarray:
     """drop scheduler"""
     assert mode in ['standard', 'early', 'late']
     if mode == 'standard':

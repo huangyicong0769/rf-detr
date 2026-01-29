@@ -15,15 +15,16 @@
 """
 Transformer class
 """
-import math
 import copy
+import math
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn, Tensor
+from torch import Tensor, nn
 
 from rfdetr.models.ops.modules import MSDeformAttn
+
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -70,7 +71,7 @@ def gen_sineembed_for_position(pos_tensor, dim=128):
 
 
 def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, unsigmoid=True):
-    """
+    r"""
     Input:
         - memory: bs, \sum{hw}, d_model
         - memory_padding_mask: bs, \sum{hw}
@@ -80,7 +81,6 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
         - output_proposals: bs, \sum{hw}, 4
     """
     N_, S_, C_ = memory.shape
-    base_scale = 4.0
     proposals = []
     _cur = 0
     for lvl, (H_, W_) in enumerate(spatial_shapes):

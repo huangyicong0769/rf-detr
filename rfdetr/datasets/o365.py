@@ -9,16 +9,16 @@
 
 """Dataset file for Object365."""
 from pathlib import Path
-
-from .coco import (
-    CocoDetection, make_coco_transforms, make_coco_transforms_square_div_64
-)
+from typing import Any
 
 from PIL import Image
+
+from rfdetr.datasets.coco import CocoDetection, make_coco_transforms, make_coco_transforms_square_div_64
+
 Image.MAX_IMAGE_PIXELS = None
 
 
-def build_o365_raw(image_set, args, resolution):
+def build_o365_raw(image_set: str, args: Any, resolution: int) -> CocoDetection:
     root = Path(args.coco_path)
     PATHS = {
         "train": (root, root / 'zhiyuan_objv2_train_val_wo_5k.json'),
@@ -26,15 +26,8 @@ def build_o365_raw(image_set, args, resolution):
     }
     img_folder, ann_file = PATHS[image_set]
 
-    try:
-        square_resize = args.square_resize
-    except:
-        square_resize = False
 
-    try:
-        square_resize_div_64 = args.square_resize_div_64
-    except:
-        square_resize_div_64 = False
+    square_resize_div_64 = getattr(args, 'square_resize_div_64', False)
 
     if square_resize_div_64:
         dataset = CocoDetection(
@@ -55,7 +48,7 @@ def build_o365_raw(image_set, args, resolution):
     return dataset
 
 
-def build_o365(image_set, args, resolution):
+def build_o365(image_set: str, args: Any, resolution: int) -> CocoDetection:
     if image_set == 'train':
         train_ds = build_o365_raw('train', args, resolution=resolution)
         return train_ds

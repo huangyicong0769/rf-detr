@@ -239,7 +239,14 @@ def list_datasets(avail: Dict[str, DatasetInfo]) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download ImageNet-related datasets with resume and md5.")
     p.add_argument("--dataset", "-d", nargs="+", default=DEFAULT_DATASETS, help="Datasets to download; names come from built-ins or scraped index")
-    p.add_argument("--out", type=pathlib.Path, default=pathlib.Path("imagenet_data"), help="Output directory")
+    p.add_argument(
+        "--out",
+        "--save-dir",
+        dest="out",
+        type=pathlib.Path,
+        default=pathlib.Path(os.environ.get("IMAGENET_OUT", "imagenet_data")),
+        help="Output directory (can also set IMAGENET_OUT)",
+    )
     p.add_argument("--list", action="store_true", help="List available datasets and exit")
     p.add_argument("--index-url", default="https://image-net.org/download-images.php", help="Index page to scrape for dataset links")
     p.add_argument("--fetch-index", action="store_true", help="Scrape index page to extend available datasets")
@@ -253,6 +260,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.out = args.out.expanduser()
 
     available: Dict[str, DatasetInfo] = dict(DATASETS)
 

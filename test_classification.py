@@ -8,8 +8,7 @@ def main():
     )
     model.train(
         dataset_file="coco",
-        coco_path="/home/hyc/rf-detr/imagenet_data/tiny-imagenet-200",
-        dataset_dir="/home/hyc/rf-detr/imagenet_data/tiny-imagenet-200",
+        coco_path="/home/hyc/datasets/imagenet_data/tiny-imagenet-200",
         output_dir="output/cls-tiny",
         num_classes=200,
         epochs=1,

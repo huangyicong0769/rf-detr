@@ -22,14 +22,16 @@ import copy
 import datetime
 import json
 import math
+import multiprocessing
 import os
 import random
 import shutil
 import time
+import warnings
 from copy import deepcopy
 from logging import getLogger
 from pathlib import Path
-from typing import DefaultDict, List, Callable
+from typing import Callable, DefaultDict, List
 
 import numpy as np
 import torch
@@ -46,11 +48,12 @@ from rfdetr.models import (
     build_classification_model,
     build_classification_criterion,
 )
+from rfdetr.platform.platform_downloads import PLATFORM_MODELS
 from rfdetr.util.benchmark import benchmark
 from rfdetr.util.drop_scheduler import drop_scheduler
 from rfdetr.util.files import download_file
 from rfdetr.util.get_param_dicts import get_param_dict
-from rfdetr.util.utils import ModelEma, BestMetricHolder, clean_state_dict
+from rfdetr.util.utils import BestMetricHolder, ModelEma, clean_state_dict
 
 if str(os.environ.get("USE_FILE_SYSTEM_SHARING", "False")).lower() in ["true", "1"]:
     import torch.multiprocessing
@@ -58,7 +61,8 @@ if str(os.environ.get("USE_FILE_SYSTEM_SHARING", "False")).lower() in ["true", "
 
 logger = getLogger(__name__)
 
-HOSTED_MODELS = {
+# THE FOLLOWING OPEN_SOURCE_MODELS ARE COVERED BY THE APACHE 2.0 LICENSE
+OPEN_SOURCE_MODELS = {
     "rf-detr-base.pth": "https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth",
     "rf-detr-base-o365.pth": "https://storage.googleapis.com/rfdetr/top-secret-1234/lwdetr_dinov2_small_o365_checkpoint.pth",
     # below is a less converged model that may be better for finetuning but worse for inference
@@ -68,7 +72,19 @@ HOSTED_MODELS = {
     "rf-detr-small.pth": "https://storage.googleapis.com/rfdetr/small_coco/checkpoint_best_regular.pth",
     "rf-detr-medium.pth": "https://storage.googleapis.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
     "rf-detr-seg-preview.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-preview.pt",
+    "rf-detr-large-2026.pth": "https://storage.googleapis.com/rfdetr/rf-detr-large-2026.pth",
+    "rf-detr-xlarge.pth": "https://storage.googleapis.com/rfdetr/rf-detr-xl-ft.pth",
+    "rf-detr-xxlarge.pth": "https://storage.googleapis.com/rfdetr/rf-detr-2xl-ft.pth",
+    "rf-detr-seg-nano.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-n-ft.pth",
+    "rf-detr-seg-small.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-s-ft.pth",
+    "rf-detr-seg-medium.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-m-ft.pth",
+    "rf-detr-seg-large.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-l-ft.pth",
+    "rf-detr-seg-xlarge.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-xl-ft.pth",
+    "rf-detr-seg-xxlarge.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-2xl-ft.pth",
 }
+
+
+HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
 
 
 def init_wandb_run(args):
@@ -438,6 +454,22 @@ class Model:
 
         effective_batch_size = args.batch_size * args.grad_accum_steps
         min_batches = kwargs.get('min_batches', 5)
+
+        num_workers = args.num_workers
+        # Hotfix for https://github.com/roboflow/rf-detr/issues/428
+        # On platforms using 'spawn' (Windows, macOS), multiprocessing requires the entry point
+        # to be protected by `if __name__ == '__main__':`. If it's missing, we force
+        # num_workers=0 to prevent a RuntimeError that crashes the process.
+        if num_workers > 0 and multiprocessing.get_start_method(allow_none=True) == 'spawn':
+            import __main__
+            if not hasattr(__main__, '__file__') or not __main__.__name__ == '__main__':
+                warnings.warn(
+                    "Setting num_workers to 0 because the script is not wrapped in "
+                    "`if __name__ == '__main__':`. This is required for multiprocessing with the 'spawn' start method.",
+                    RuntimeWarning
+                )
+                num_workers = 0
+
         if len(dataset_train) < effective_batch_size * min_batches:
             logger.info(
                 f"Training with uniform sampler because dataset is too small: {len(dataset_train)} < {effective_batch_size * min_batches}"
@@ -451,7 +483,7 @@ class Model:
                 dataset_train,
                 batch_size=effective_batch_size,
                 collate_fn=utils.collate_fn,
-                num_workers=args.num_workers,
+                num_workers=num_workers,
                 sampler=sampler,
             )
         else:
@@ -461,15 +493,15 @@ class Model:
                 dataset_train,
                 batch_sampler=batch_sampler_train,
                 collate_fn=utils.collate_fn,
-                num_workers=args.num_workers
+                num_workers=num_workers
             )
 
         data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                     drop_last=False, collate_fn=utils.collate_fn,
-                                    num_workers=args.num_workers)
+                                    num_workers=num_workers)
         data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
                                     drop_last=False, collate_fn=utils.collate_fn,
-                                    num_workers=args.num_workers)
+                                    num_workers=num_workers)
 
         base_ds = get_coco_api_from_dataset(dataset_val)
         base_ds_test = get_coco_api_from_dataset(dataset_test)
@@ -572,7 +604,7 @@ class Model:
 
                         utils.save_on_master(weights, checkpoint_path)
 
-            with torch.inference_mode():
+            with torch.no_grad():
                 test_stats, coco_evaluator = evaluate(
                     model, criterion, postprocess, data_loader_val, base_ds, device, args=args
                 )
@@ -721,9 +753,9 @@ class Model:
 
     def export(self, output_dir="output", infer_dir=None, simplify=False,  backbone_only=False, opset_version=17, verbose=True, force=False, shape=None, batch_size=1, **kwargs):
         """Export the trained model to ONNX format"""
-        print(f"Exporting model to ONNX format")
+        print("Exporting model to ONNX format")
         try:
-            from rfdetr.deploy.export import export_onnx, onnx_simplify, make_infer_image
+            from rfdetr.deploy.export import export_onnx, make_infer_image, onnx_simplify
         except ImportError:
             print("It seems some dependencies for ONNX export are missing. Please run `pip install rfdetr[onnxexport]` and try again.")
             raise
@@ -986,7 +1018,7 @@ def get_args_parser():
     parser.add_argument('--multi_label', action='store_true', help='Enable multi-label classification (sigmoid + BCE)')
 
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
+    parser.add_argument('--dataset_file', default="coco")
     parser.add_argument('--use_test_split', action='store_true',
                         help='Use test split when available (for custom COCO-style data)')
     parser.add_argument('--coco_path', type=str)
@@ -1146,7 +1178,7 @@ def populate_args(
     multi_label=False,
 
     # Dataset parameters
-    dataset_file='coco',
+    dataset_file="coco",
     use_test_split=False,
     coco_path=None,
     dataset_dir=None,
