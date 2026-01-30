@@ -290,6 +290,26 @@ class Model:
                 num_workers=args.num_workers
             )
 
+            # for cosine annealing, calculate total training steps and warmup steps
+            num_training_steps_per_epoch_lr = len(data_loader_train)
+            total_training_steps_lr = num_training_steps_per_epoch_lr * args.epochs
+            warmup_steps_lr = num_training_steps_per_epoch_lr * args.warmup_epochs
+            def lr_lambda(current_step: int):
+                if current_step < warmup_steps_lr:
+                    # Linear warmup
+                    return float(current_step) / float(max(1, warmup_steps_lr))
+                else:
+                    # Cosine annealing from multiplier 1.0 down to lr_min_factor
+                    if args.lr_scheduler == 'cosine':
+                        progress = float(current_step - warmup_steps_lr) / float(max(1, total_training_steps_lr - warmup_steps_lr))
+                        return args.lr_min_factor + (1 - args.lr_min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
+                    elif args.lr_scheduler == 'step':
+                        if current_step < args.lr_drop * num_training_steps_per_epoch_lr:
+                            return 1.0
+                        else:
+                            return 0.1
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
             data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                         drop_last=False, collate_fn=utils.collate_fn,
                                         num_workers=args.num_workers)
@@ -304,9 +324,6 @@ class Model:
             best_val_stats_ema = None
             ema_m = ModelEma(model_without_ddp, decay=args.ema_decay, tau=args.ema_tau) if args.use_ema else None
 
-            # W&B logging handled via MetricsWandBSink callbacks for classification
-            wandb_run = None
-
             for epoch in range(args.start_epoch, args.epochs):
                 if args.distributed:
                     sampler_train.set_epoch(epoch)
@@ -314,6 +331,7 @@ class Model:
                 train_stats = train_one_epoch_cls(
                     model, criterion, data_loader_train, optimizer, device, epoch, args=args,
                     max_norm=args.clip_max_norm, ema_m=ema_m, callbacks=self.callbacks,
+                    lr_scheduler=lr_scheduler,
                 )
 
                 val_stats = evaluate_cls(model, criterion, data_loader_val, device, args=args, callbacks=self.callbacks, epoch=epoch, flavor="base")
@@ -341,6 +359,14 @@ class Model:
                             'n_parameters': n_parameters}
                 if ema_val_stats is not None:
                     log_stats.update({f'val_ema_{k}': v for k, v in ema_val_stats.items()})
+                log_stats["test_coco_eval_cls"] = val_stats
+                if ema_val_stats is not None:
+                    log_stats["ema_test_coco_eval_cls"] = ema_val_stats
+                if 'val_loss' in log_stats and 'test_loss' not in log_stats:
+                    log_stats['test_loss'] = log_stats['val_loss']
+                if self.callbacks and "on_fit_epoch_end" in self.callbacks:
+                    for callback in self.callbacks["on_fit_epoch_end"]:
+                        callback(log_stats)
 
                 if args.output_dir:
                     log_jsonl(output_dir, "log.txt", log_stats)

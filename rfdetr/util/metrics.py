@@ -303,6 +303,20 @@ class MetricsWandBSink:
             if ema_ar50_90 is not None:
                 log_dict["Metrics/EMA/AR50_90"] = ema_ar50_90
 
+        if 'test_coco_eval_cls' in values:
+            cls_eval = values['test_coco_eval_cls']
+            if isinstance(cls_eval, dict):
+                for k, v in cls_eval.items():
+                    if isinstance(v, (int, float)):
+                        log_dict[f"Metrics/Base/{k}"] = v
+
+        if 'ema_test_coco_eval_cls' in values:
+            ema_cls_eval = values['ema_test_coco_eval_cls']
+            if isinstance(ema_cls_eval, dict):
+                for k, v in ema_cls_eval.items():
+                    if isinstance(v, (int, float)):
+                        log_dict[f"Metrics/EMA/{k}"] = v
+
         wandb.log(log_dict)
 
     def close(self):

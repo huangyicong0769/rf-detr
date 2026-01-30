@@ -562,6 +562,7 @@ def train_one_epoch_cls(
     args=None,
     max_norm: float = 0,
     ema_m: torch.nn.Module = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     callbacks: DefaultDict[str, List[Callable]] | None = None,
 ):
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -599,6 +600,8 @@ def train_one_epoch_cls(
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         if ema_m is not None:
             ema_m.update(model)
 
@@ -609,12 +612,6 @@ def train_one_epoch_cls(
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    stats["train_loss"] = stats.get("loss")
-    stats["epoch"] = epoch
-    stats["flavor"] = "train"
-    if callbacks:
-        for callback in callbacks["on_fit_epoch_end"]:
-            callback(stats)
     return stats
 
 

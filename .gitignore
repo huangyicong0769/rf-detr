@@ -179,6 +179,7 @@ cython_debug/
 rf-detr*
 output/*
 wandb
+log*
 
 train_test.py
 
