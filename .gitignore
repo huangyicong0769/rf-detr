@@ -182,6 +182,7 @@ wandb
 log*
 
 train_test.py
+test_*.py
 
 # Ddatasets
 imagenet*/
