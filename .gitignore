@@ -178,6 +178,7 @@ cython_debug/
 # model artifacts
 rf-detr*
 output/*
+wandb
 
 train_test.py
 

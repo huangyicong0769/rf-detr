@@ -87,22 +87,6 @@ OPEN_SOURCE_MODELS = {
 HOSTED_MODELS = {**OPEN_SOURCE_MODELS, **PLATFORM_MODELS}
 
 
-def init_wandb_run(args):
-    if not args.wandb or not utils.is_main_process():
-        return None
-    try:
-        import wandb  # type: ignore
-        return wandb.init(
-            project=args.project or "rf-detr",
-            name=args.run,
-            config=vars(args),
-            reinit=True,
-        )
-    except Exception as e:
-        print(f"Failed to init Weights & Biases logging: {e}")
-        return None
-
-
 def log_jsonl(output_dir: Path, filename: str, payload: dict):
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / filename).open("a") as f:
@@ -320,8 +304,8 @@ class Model:
             best_val_stats_ema = None
             ema_m = ModelEma(model_without_ddp, decay=args.ema_decay, tau=args.ema_tau) if args.use_ema else None
 
-            # optional W&B logging (main process only)
-            wandb_run = init_wandb_run(args)
+            # W&B logging handled via MetricsWandBSink callbacks for classification
+            wandb_run = None
 
             for epoch in range(args.start_epoch, args.epochs):
                 if args.distributed:
@@ -357,12 +341,6 @@ class Model:
                             'n_parameters': n_parameters}
                 if ema_val_stats is not None:
                     log_stats.update({f'val_ema_{k}': v for k, v in ema_val_stats.items()})
-
-                if wandb_run is not None:
-                    try:
-                        wandb_run.log(log_stats)
-                    except Exception as e:
-                        print(f"wandb log failed at epoch {epoch}: {e}")
 
                 if args.output_dir:
                     log_jsonl(output_dir, "log.txt", log_stats)
@@ -400,13 +378,6 @@ class Model:
                 if best_ckpt_path.exists():
                     shutil.copy2(best_ckpt_path, output_dir / "checkpoint_best_total.pth")
                     utils.strip_checkpoint(output_dir / "checkpoint_best_total.pth")
-            if wandb_run is not None:
-                try:
-                    wandb_run.log({f'test_{k}': v for k, v in test_stats.items()})
-                except Exception as e:
-                    print(f"wandb log failed on test: {e}")
-                wandb_run.finish()
-
             # fire on_train_end callbacks (e.g., metrics plotting) for classification
             if self.callbacks and "on_train_end" in self.callbacks:
                 for callback in self.callbacks["on_train_end"]:
