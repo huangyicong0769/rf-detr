@@ -573,6 +573,11 @@ def train_one_epoch_cls(
     model.train()
     criterion.train()
 
+    if DEPRECATED_AMP:
+        scaler = GradScaler(enabled=args.amp)
+    else:
+        scaler = GradScaler('cuda', enabled=args.amp)
+
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()} for t in targets]
@@ -596,10 +601,12 @@ def train_one_epoch_cls(
             class_error = (1.0 - micro_f1) * 100.0
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
         if max_norm > 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         if lr_scheduler is not None:
             lr_scheduler.step()
         if ema_m is not None:
@@ -618,6 +625,9 @@ def train_one_epoch_cls(
 @torch.no_grad()
 def evaluate_cls(model, criterion, data_loader, device, args=None, callbacks: DefaultDict[str, List[Callable]] | None = None, epoch: int | None = None, flavor: str = "base"):
     model.eval()
+    fp16_eval = bool(getattr(args, "fp16_eval", False))
+    if fp16_eval:
+        model.half()
     criterion.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -629,9 +639,15 @@ def evaluate_cls(model, criterion, data_loader, device, args=None, callbacks: De
         samples = samples.to(device)
         targets = [{k: v.to(device) if torch.is_tensor(v) else v for k, v in t.items()} for t in targets]
 
+        if fp16_eval:
+            samples.tensors = samples.tensors.half()
+
         with autocast(**get_autocast_args(args)):
             outputs = model(samples)
             loss_dict = criterion(outputs, targets)
+
+        if fp16_eval:
+            outputs["logits"] = outputs["logits"].float()
 
         with torch.no_grad():
             probs = outputs['logits'].sigmoid()
@@ -653,7 +669,7 @@ def evaluate_cls(model, criterion, data_loader, device, args=None, callbacks: De
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
 
-    stats = {"epoch": epoch if epoch is not None else -1}
+    stats: dict[str, object] = {"epoch": epoch if epoch is not None else -1}
     stats.update({k: meter.global_avg for k, meter in metric_logger.meters.items()})
     stats["test_loss"] = stats.get("loss")
     stats["flavor"] = flavor
